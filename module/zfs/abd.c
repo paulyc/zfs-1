@@ -459,7 +459,7 @@ abd_alloc(size_t size, boolean_t is_metadata)
 	}
 	abd->abd_size = size;
 	abd->abd_parent = NULL;
-	refcount_create(&abd->abd_children);
+	zfs_refcount_create(&abd->abd_children);
 
 	abd->abd_u.abd_scatter.abd_offset = 0;
 	abd->abd_u.abd_scatter.abd_chunk_size = zfs_abd_chunk_size;
@@ -500,7 +500,7 @@ abd_free_scatter(abd_t *abd)
 		abd_free_chunk(abd->abd_u.abd_scatter.abd_chunks[i]);
 	}
 
-	refcount_destroy(&abd->abd_children);
+	zfs_refcount_destroy(&abd->abd_children);
 	ABDSTAT_BUMPDOWN(abdstat_scatter_cnt);
 	ABDSTAT_INCR(abdstat_scatter_data_size, -(int)abd->abd_size);
 	ABDSTAT_INCR(abdstat_scatter_chunk_waste,
@@ -541,7 +541,7 @@ abd_alloc_linear(size_t size, boolean_t is_metadata)
 	}
 	abd->abd_size = size;
 	abd->abd_parent = NULL;
-	refcount_create(&abd->abd_children);
+	zfs_refcount_create(&abd->abd_children);
 
 	if (is_metadata) {
 		abd->abd_u.abd_linear.abd_buf = zio_buf_alloc(size);
@@ -572,7 +572,7 @@ abd_free_linear(abd_t *abd)
 		zio_data_buf_free(abd->abd_u.abd_linear.abd_buf, abd->abd_size);
 	}
 
-	refcount_destroy(&abd->abd_children);
+	zfs_refcount_destroy(&abd->abd_children);
 	ABDSTAT_BUMPDOWN(abdstat_linear_cnt);
 	ABDSTAT_INCR(abdstat_linear_data_size, -(int)abd->abd_size);
 
@@ -696,8 +696,8 @@ abd_get_offset_impl(abd_t *sabd, size_t off, size_t size)
 	abd->abd_size = sabd->abd_size - off;
 	abd->abd_parent = sabd;
 	abd->abd_flags |= ABD_FLAG_NOMOVE;
-	refcount_create(&abd->abd_children);
-	(void) refcount_add_many(&sabd->abd_children, abd->abd_size, abd);
+	zfs_refcount_create(&abd->abd_children);
+	(void) zfs_refcount_add_many(&sabd->abd_children, abd->abd_size, abd);
 	mutex_exit(&sabd->abd_mutex);
 
 	return (abd);
@@ -747,7 +747,7 @@ abd_get_from_buf(void *buf, size_t size)
 	abd->abd_flags = ABD_FLAG_LINEAR | ABD_FLAG_NOMOVE;
 	abd->abd_size = size;
 	abd->abd_parent = NULL;
-	refcount_create(&abd->abd_children);
+	zfs_refcount_create(&abd->abd_children);
 
 	abd->abd_u.abd_linear.abd_buf = buf;
 
@@ -767,14 +767,14 @@ abd_put(abd_t *abd)
 
 	if (abd->abd_parent != NULL) {
 		mutex_enter(&abd->abd_parent->abd_mutex);
-		(void) refcount_remove_many(&abd->abd_parent->abd_children,
+		(void) zfs_refcount_remove_many(&abd->abd_parent->abd_children,
 		    abd->abd_size, abd);
-		if (refcount_is_zero(&abd->abd_parent->abd_children))
+		if (zfs_refcount_is_zero(&abd->abd_parent->abd_children))
 			abd->abd_parent->abd_flags &= ~(ABD_FLAG_NOMOVE);
 		mutex_exit(&abd->abd_parent->abd_mutex);
 	}
 
-	refcount_destroy(&abd->abd_children);
+	zfs_refcount_destroy(&abd->abd_children);
 	mutex_exit(&abd->abd_mutex);
 	abd_free_struct(abd);
 }
@@ -826,7 +826,8 @@ abd_borrow_buf(abd_t *abd, size_t n)
 	} else {
 		buf = zio_buf_alloc(n);
 	}
-	(void) refcount_add_many(&abd->abd_children, n, buf);
+
+	(void) zfs_refcount_add_many(&abd->abd_children, n, buf);
 	mutex_exit(&abd->abd_mutex);
 
 	ABDSTAT_BUMP(abdstat_borrowed_buf_cnt);
@@ -867,7 +868,8 @@ abd_return_buf(abd_t *abd, void *buf, size_t n)
 		mutex_enter(&abd->abd_mutex);
 		zio_buf_free(buf, n);
 	}
-	(void) refcount_remove_many(&abd->abd_children, n, buf);
+
+	(void) zfs_refcount_remove_many(&abd->abd_children, n, buf);
 	mutex_exit(&abd->abd_mutex);
 	ABDSTAT_BUMPDOWN(abdstat_borrowed_buf_cnt);
 }
@@ -920,7 +922,7 @@ abd_return_buf_off(abd_t *abd, void *buf, size_t off, size_t len, size_t n)
 		mutex_enter(&abd->abd_mutex);
 		zio_buf_free(buf, n);
 	}
-	(void) refcount_remove_many(&abd->abd_children, n, buf);
+	(void) zfs_refcount_remove_many(&abd->abd_children, n, buf);
 	mutex_exit(&abd->abd_mutex);
 	ABDSTAT_BUMPDOWN(abdstat_borrowed_buf_cnt);
 }
@@ -1341,6 +1343,180 @@ abd_cmp(abd_t *dabd, abd_t *sabd, size_t size)
 	return (abd_iterate_func2(dabd, sabd, 0, 0, size, abd_cmp_cb, NULL));
 }
 
+/*
+ * Iterate over code ABDs and a data ABD and call @func_raidz_gen.
+ *
+ * @cabds          parity ABDs, must have equal size
+ * @dabd           data ABD. Can be NULL (in this case @dsize = 0)
+ * @func_raidz_gen should be implemented so that its behaviour
+ *                 is the same when taking linear and when taking scatter
+ */
+void
+abd_raidz_gen_iterate(abd_t **cabds, abd_t *dabd,
+    ssize_t csize, ssize_t dsize, const unsigned parity,
+    void (*func_raidz_gen)(void **, const void *, size_t, size_t))
+{
+	int i;
+	ssize_t len, dlen;
+	struct abd_iter caiters[3];
+	struct abd_iter daiter = {0};
+	void *caddrs[3];
+	// unsigned long flags;
+
+	ASSERT3U(parity, <=, 3);
+
+	for (i = 0; i < parity; i++)
+		abd_iter_init(&caiters[i], cabds[i] /*, i*/ );
+
+	if (dabd)
+		abd_iter_init(&daiter, dabd /*, i */);
+
+	ASSERT3S(dsize, >=, 0);
+
+#ifdef linux
+	local_irq_save(flags);
+#endif
+	while (csize > 0) {
+		len = csize;
+
+		if (dabd && dsize > 0)
+			abd_iter_map(&daiter);
+
+		for (i = 0; i < parity; i++) {
+			abd_iter_map(&caiters[i]);
+			caddrs[i] = caiters[i].iter_mapaddr;
+		}
+
+		switch (parity) {
+			case 3:
+				len = MIN(caiters[2].iter_mapsize, len);
+			case 2:
+				len = MIN(caiters[1].iter_mapsize, len);
+			case 1:
+				len = MIN(caiters[0].iter_mapsize, len);
+		}
+
+		/* must be progressive */
+		ASSERT3S(len, >, 0);
+
+		if (dabd && dsize > 0) {
+			/* this needs precise iter.length */
+			len = MIN(daiter.iter_mapsize, len);
+			dlen = len;
+		} else
+			dlen = 0;
+
+		/* must be progressive */
+		ASSERT3S(len, >, 0);
+		/*
+		 * The iterated function likely will not do well if each
+		 * segment except the last one is not multiple of 512 (raidz).
+		 */
+		ASSERT3U(((uint64_t)len & 511ULL), ==, 0);
+
+		func_raidz_gen(caddrs, daiter.iter_mapaddr, len, dlen);
+
+		for (i = parity-1; i >= 0; i--) {
+			abd_iter_unmap(&caiters[i]);
+			abd_iter_advance(&caiters[i], len);
+		}
+
+		if (dabd && dsize > 0) {
+			abd_iter_unmap(&daiter);
+			abd_iter_advance(&daiter, dlen);
+			dsize -= dlen;
+		}
+
+		csize -= len;
+
+		ASSERT3S(dsize, >=, 0);
+		ASSERT3S(csize, >=, 0);
+	}
+#ifdef linux
+	local_irq_restore(flags);
+#endif
+}
+
+/*
+ * Iterate over code ABDs and data reconstruction target ABDs and call
+ * @func_raidz_rec. Function maps at most 6 pages atomically.
+ *
+ * @cabds           parity ABDs, must have equal size
+ * @tabds           rec target ABDs, at most 3
+ * @tsize           size of data target columns
+ * @func_raidz_rec  expects syndrome data in target columns. Function
+ *                  reconstructs data and overwrites target columns.
+ */
+void
+abd_raidz_rec_iterate(abd_t **cabds, abd_t **tabds,
+    ssize_t tsize, const unsigned parity,
+    void (*func_raidz_rec)(void **t, const size_t tsize, void **c,
+    const unsigned *mul),
+    const unsigned *mul)
+{
+	int i;
+	ssize_t len;
+	struct abd_iter citers[3];
+	struct abd_iter xiters[3];
+	void *caddrs[3], *xaddrs[3];
+	// unsigned long flags;
+
+	ASSERT3U(parity, <=, 3);
+
+	for (i = 0; i < parity; i++) {
+		abd_iter_init(&citers[i], cabds[i] /*, 2*i */);
+		abd_iter_init(&xiters[i], tabds[i] /*, 2*i+1*/ );
+	}
+
+#ifdef linux
+	local_irq_save(flags);
+#endif
+	while (tsize > 0) {
+
+		for (i = 0; i < parity; i++) {
+			abd_iter_map(&citers[i]);
+			abd_iter_map(&xiters[i]);
+			caddrs[i] = citers[i].iter_mapaddr;
+			xaddrs[i] = xiters[i].iter_mapaddr;
+		}
+
+		len = tsize;
+		switch (parity) {
+			case 3:
+				len = MIN(xiters[2].iter_mapsize, len);
+				len = MIN(citers[2].iter_mapsize, len);
+			case 2:
+				len = MIN(xiters[1].iter_mapsize, len);
+				len = MIN(citers[1].iter_mapsize, len);
+			case 1:
+				len = MIN(xiters[0].iter_mapsize, len);
+				len = MIN(citers[0].iter_mapsize, len);
+		}
+		/* must be progressive */
+		ASSERT3S(len, >, 0);
+		/*
+		 * The iterated function likely will not do well if each
+		 * segment except the last one is not multiple of 512 (raidz).
+		 */
+		ASSERT3U(((uint64_t)len & 511ULL), ==, 0);
+
+		func_raidz_rec(xaddrs, len, caddrs, mul);
+
+		for (i = parity-1; i >= 0; i--) {
+			abd_iter_unmap(&xiters[i]);
+			abd_iter_unmap(&citers[i]);
+			abd_iter_advance(&xiters[i], len);
+			abd_iter_advance(&citers[i], len);
+		}
+
+		tsize -= len;
+		ASSERT3S(tsize, >=, 0);
+	}
+#ifdef linux
+	local_irq_restore(flags);
+#endif
+}
+
 #ifdef __APPLE__
 
 /*
@@ -1358,7 +1534,7 @@ abd_try_move_scattered_impl(abd_t *abd)
 
 	abd_verify(abd);
 
-	if (!refcount_is_zero(&abd->abd_children)) {
+	if (!zfs_refcount_is_zero(&abd->abd_children)) {
 		mutex_exit(&abd->abd_mutex);
 		ABDSTAT_BUMP(abdstat_move_refcount_nonzero);
 		return (B_FALSE);
@@ -1416,7 +1592,7 @@ abd_try_move_linear_impl(abd_t *abd)
 
 	abd_verify(abd);
 
-	if (!refcount_is_zero(&abd->abd_children)) {
+	if (!zfs_refcount_is_zero(&abd->abd_children)) {
 		mutex_exit(&abd->abd_mutex);
 		ABDSTAT_BUMP(abdstat_move_refcount_nonzero);
 		return (B_FALSE);

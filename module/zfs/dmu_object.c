@@ -24,6 +24,7 @@
  * Copyright 2014 HybridCluster. All rights reserved.
  */
 
+#include <sys/dbuf.h>
 #include <sys/dmu.h>
 #include <sys/dmu_objset.h>
 #include <sys/dmu_tx.h>
@@ -44,7 +45,7 @@ int dmu_object_alloc_chunk_shift = 7;
 static uint64_t
 dmu_object_alloc_impl(objset_t *os, dmu_object_type_t ot, int blocksize,
     int indirect_blockshift, dmu_object_type_t bonustype, int bonuslen,
-    int dnodesize, dmu_tx_t *tx)
+    int dnodesize, dnode_t **allocated_dnode, void *tag, dmu_tx_t *tx)
 {
 	uint64_t object;
 	uint64_t L1_dnode_count = DNODES_PER_BLOCK <<
@@ -52,10 +53,14 @@ dmu_object_alloc_impl(objset_t *os, dmu_object_type_t ot, int blocksize,
 	dnode_t *dn = NULL;
 	int dn_slots = dnodesize >> DNODE_SHIFT;
 	boolean_t restarted = B_FALSE;
-	uint64_t *cpuobj = &os->os_obj_next_percpu[CPU_SEQID %
-	    os->os_obj_next_percpu_len];
+	uint64_t *cpuobj = NULL;
 	int dnodes_per_chunk = 1 << dmu_object_alloc_chunk_shift;
 	int error;
+
+	kpreempt_disable();
+	cpuobj = &os->os_obj_next_percpu[CPU_SEQID %
+	    os->os_obj_next_percpu_len];
+	kpreempt_enable();
 
 	if (dn_slots == 0) {
 		dn_slots = DNODE_MIN_SLOTS;
@@ -76,8 +81,20 @@ dmu_object_alloc_impl(objset_t *os, dmu_object_type_t ot, int blocksize,
 	if (dnodes_per_chunk > L1_dnode_count)
 		dnodes_per_chunk = L1_dnode_count;
 
-	object = *cpuobj;
+	/*
+	 * The caller requested the dnode be returned as a performance
+	 * optimization in order to avoid releasing the hold only to
+	 * immediately reacquire it.  Since they caller is responsible
+	 * for releasing the hold they must provide the tag.
+	 */
+	if (allocated_dnode != NULL) {
+		ASSERT3P(tag, !=, NULL);
+	} else {
+		ASSERT3P(tag, ==, NULL);
+		tag = FTAG;
+	}
 
+	object = *cpuobj;
 	for (;;) {
 		/*
 		 * If we finished a chunk of dnodes, get a new one from
@@ -99,7 +116,7 @@ dmu_object_alloc_impl(objset_t *os, dmu_object_type_t ot, int blocksize,
 			 * from the beginning at most once per txg. If we
 			 * still can't allocate from that L1 block, search
 			 * for an empty L0 block, which will quickly skip
-			 * to the end of the metadnode if the no nearby L0
+			 * to the end of the metadnode if no nearby L0
 			 * blocks are empty. This fallback avoids a
 			 * pathology where full dnode blocks containing
 			 * large dnodes appear sparse because they have a
@@ -114,7 +131,7 @@ dmu_object_alloc_impl(objset_t *os, dmu_object_type_t ot, int blocksize,
 			 *
 			 * Note that dmu_traverse depends on the behavior
 			 * that we use multiple blocks of the dnode object
-			 * before going back to reuse objects. Any change
+			 * before going back to reuse objects.  Any change
 			 * to this algorithm should preserve that property
 			 * or find another solution to the issues described
 			 * in traverse_visitbp.
@@ -164,7 +181,7 @@ dmu_object_alloc_impl(objset_t *os, dmu_object_type_t ot, int blocksize,
 		 * to do so.
 		 */
 		error = dnode_hold_impl(os, object, DNODE_MUST_BE_FREE,
-		    dn_slots, FTAG, &dn);
+		    dn_slots, tag, &dn);
 		if (error == 0) {
 			rw_enter(&dn->dn_struct_rwlock, RW_WRITER);
 			/*
@@ -172,20 +189,30 @@ dmu_object_alloc_impl(objset_t *os, dmu_object_type_t ot, int blocksize,
 			 * again now that we have the struct lock.
 			 */
 			if (dn->dn_type == DMU_OT_NONE) {
-				dnode_allocate(dn, ot, blocksize, 0,
-				    bonustype, bonuslen, dn_slots, tx);
+				dnode_allocate(dn, ot, blocksize,
+				    indirect_blockshift, bonustype,
+				    bonuslen, dn_slots, tx);
 				rw_exit(&dn->dn_struct_rwlock);
 				dmu_tx_add_new_object(tx, dn);
-				dnode_rele(dn, FTAG);
+
+				/*
+				 * Caller requested the allocated dnode be
+				 * returned and is responsible for the hold.
+				 */
+				if (allocated_dnode != NULL)
+					*allocated_dnode = dn;
+				else
+					dnode_rele(dn, tag);
+
 				return (object);
 			}
 			rw_exit(&dn->dn_struct_rwlock);
-			dnode_rele(dn, FTAG);
+			dnode_rele(dn, tag);
 			DNODE_STAT_BUMP(dnode_alloc_race);
 		}
 
 		/*
-		 * Skip to next known valid starting point on error. This
+		 * Skip to next known valid starting point on error.  This
 		 * is the start of the next block of dnodes.
 		 */
 		if (dmu_object_next(os, &object, B_TRUE, 0) != 0) {
@@ -200,8 +227,8 @@ uint64_t
 dmu_object_alloc(objset_t *os, dmu_object_type_t ot, int blocksize,
     dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx)
 {
-	return (dmu_object_alloc_impl(os, ot, blocksize, 0, bonustype,
-	    bonuslen, 0, tx));
+	return dmu_object_alloc_impl(os, ot, blocksize, 0, bonustype,
+	    bonuslen, 0, NULL, NULL, tx);
 }
 
 uint64_t
@@ -209,8 +236,8 @@ dmu_object_alloc_ibs(objset_t *os, dmu_object_type_t ot, int blocksize,
     int indirect_blockshift, dmu_object_type_t bonustype, int bonuslen,
     dmu_tx_t *tx)
 {
-	return (dmu_object_alloc_impl(os, ot, blocksize, indirect_blockshift,
-	    bonustype, bonuslen, 0, tx));
+	return dmu_object_alloc_impl(os, ot, blocksize, indirect_blockshift,
+	    bonustype, bonuslen, 0, NULL, NULL, tx);
 }
 
 uint64_t
@@ -218,7 +245,21 @@ dmu_object_alloc_dnsize(objset_t *os, dmu_object_type_t ot, int blocksize,
     dmu_object_type_t bonustype, int bonuslen, int dnodesize, dmu_tx_t *tx)
 {
 	return (dmu_object_alloc_impl(os, ot, blocksize, 0, bonustype,
-	    bonuslen, dnodesize, tx));
+	    bonuslen, dnodesize, NULL, NULL, tx));
+}
+
+/*
+ * Allocate a new object and return a pointer to the newly allocated dnode
+ * via the allocated_dnode argument.  The returned dnode will be held and
+ * the caller is responsible for releasing the hold by calling dnode_rele().
+ */
+uint64_t
+dmu_object_alloc_hold(objset_t *os, dmu_object_type_t ot, int blocksize,
+    int indirect_blockshift, dmu_object_type_t bonustype, int bonuslen,
+    int dnodesize, dnode_t **allocated_dnode, void *tag, dmu_tx_t *tx)
+{
+	return (dmu_object_alloc_impl(os, ot, blocksize, indirect_blockshift,
+	    bonustype, bonuslen, dnodesize, allocated_dnode, tag, tx));
 }
 
 int
@@ -263,17 +304,20 @@ dmu_object_reclaim(objset_t *os, uint64_t object, dmu_object_type_t ot,
     int blocksize, dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx)
 {
 	return (dmu_object_reclaim_dnsize(os, object, ot, blocksize, bonustype,
-	    bonuslen, 0, tx));
+	    bonuslen, DNODE_MIN_SIZE, B_FALSE, tx));
 }
 
 int
 dmu_object_reclaim_dnsize(objset_t *os, uint64_t object, dmu_object_type_t ot,
     int blocksize, dmu_object_type_t bonustype, int bonuslen, int dnodesize,
-    dmu_tx_t *tx)
+    boolean_t keep_spill, dmu_tx_t *tx)
 {
 	dnode_t *dn;
 	int dn_slots = dnodesize >> DNODE_SHIFT;
 	int err;
+
+	if (dn_slots == 0)
+		dn_slots = DNODE_MIN_SLOTS;
 
 	if (object == DMU_META_DNODE_OBJECT)
 		return (SET_ERROR(EBADF));
@@ -283,7 +327,30 @@ dmu_object_reclaim_dnsize(objset_t *os, uint64_t object, dmu_object_type_t ot,
 	if (err)
 		return (err);
 
-	dnode_reallocate(dn, ot, blocksize, bonustype, bonuslen, dn_slots, tx);
+	dnode_reallocate(dn, ot, blocksize, bonustype, bonuslen, dn_slots,
+	    keep_spill, tx);
+
+	dnode_rele(dn, FTAG);
+	return (err);
+}
+
+int
+dmu_object_rm_spill(objset_t *os, uint64_t object, dmu_tx_t *tx)
+{
+	dnode_t *dn;
+	int err;
+
+	err = dnode_hold_impl(os, object, DNODE_MUST_BE_ALLOCATED, 0,
+	    FTAG, &dn);
+	if (err)
+		return (err);
+
+	rw_enter(&dn->dn_struct_rwlock, RW_WRITER);
+	if (dn->dn_phys->dn_flags & DNODE_FLAG_SPILL_BLKPTR) {
+		dbuf_rm_spill(dn, tx);
+		dnode_rm_spill(dn, tx);
+	}
+	rw_exit(&dn->dn_struct_rwlock);
 
 	dnode_rele(dn, FTAG);
 	return (err);
@@ -405,7 +472,7 @@ dmu_object_zapify(objset_t *mos, uint64_t object, dmu_object_type_t old_type,
 	 * so that concurrent calls to *_is_zapified() can determine if
 	 * the object has been completely zapified by checking the type.
 	 */
-	mzap_create_impl(mos, object, 0, 0, tx);
+	mzap_create_impl(dn, 0, 0, tx);
 
 	dn->dn_next_type[tx->tx_txg & TXG_MASK] = dn->dn_type =
 	    DMU_OTN_ZAP_METADATA;
@@ -435,12 +502,24 @@ dmu_object_free_zapified(objset_t *mos, uint64_t object, dmu_tx_t *tx)
 	VERIFY0(dmu_object_free(mos, object, tx));
 }
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
 EXPORT_SYMBOL(dmu_object_alloc);
+EXPORT_SYMBOL(dmu_object_alloc_ibs);
+EXPORT_SYMBOL(dmu_object_alloc_dnsize);
+EXPORT_SYMBOL(dmu_object_alloc_hold);
 EXPORT_SYMBOL(dmu_object_claim);
+EXPORT_SYMBOL(dmu_object_claim_dnsize);
 EXPORT_SYMBOL(dmu_object_reclaim);
+EXPORT_SYMBOL(dmu_object_reclaim_dnsize);
+EXPORT_SYMBOL(dmu_object_rm_spill);
 EXPORT_SYMBOL(dmu_object_free);
 EXPORT_SYMBOL(dmu_object_next);
 EXPORT_SYMBOL(dmu_object_zapify);
 EXPORT_SYMBOL(dmu_object_free_zapified);
+
+/* BEGIN CSTYLED */
+module_param(dmu_object_alloc_chunk_shift, int, 0644);
+MODULE_PARM_DESC(dmu_object_alloc_chunk_shift,
+	"CPU-specific allocator grabs 2^N objects at once");
+/* END CSTYLED */
 #endif

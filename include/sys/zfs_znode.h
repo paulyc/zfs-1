@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright 2016 Nexenta Systems, Inc. All rights reserved.
  */
 
@@ -39,6 +39,7 @@
 #include <sys/zfs_sa.h>
 #include <sys/zfs_stat.h>
 #endif
+#include <sys/zfs_rlock.h>
 #include <sys/zfs_acl.h>
 #include <sys/zil.h>
 #include <sys/vnode_if.h>
@@ -221,8 +222,7 @@ typedef struct znode {
 	krwlock_t	z_parent_lock;	/* parent lock for directories */
 	krwlock_t	z_name_lock;	/* "master" lock for dirent locks */
 	zfs_dirlock_t	*z_dirlocks;	/* directory entry lock list */
-	kmutex_t	z_range_lock;	/* protects changes to z_range_avl */
-	avl_tree_t	z_range_avl;	/* avl tree of file range locks */
+	rangelock_t	z_rangelock;	/* file range locks */
 	uint8_t		z_unlinked;	/* file has been unlinked */
 	uint8_t		z_atime_dirty;	/* atime needs to be synced */
 	uint8_t		z_zn_prefetch;	/* Prefetch znodes? */
@@ -257,7 +257,6 @@ typedef struct znode {
     krwlock_t   z_map_lock;     /* page map lock */
 
 #ifdef __APPLE__
-	list_node_t	z_link_reclaim_node;	/* all reclaim znodes in fs link */
     uint32_t    z_vid;  /* OSX vnode_vid */
 	uint32_t    z_document_id;
 
@@ -271,12 +270,16 @@ typedef struct znode {
 	boolean_t   z_finder_hardlink;  /* set high if it ever had a hardlink hash */
 
 	boolean_t   z_fastpath;
-	boolean_t   z_reclaim_reentry; /* vnode_create()->vnop_reclaim() */
 	uint64_t    z_write_gencount;
-#endif
 
-#ifdef ZFS_DEBUG
-	list_t		z_stalker;	/*vnode life tracker */
+	/*
+	 * With async vnode attachment to the znode, it may need to
+	 * wait for the taskq to complete, so we setup a condvar to
+	 * block on. See zfs_async* calls in zfs_vnop_osx.c
+	 */
+	taskq_ent_t z_attach_taskq;
+	kcondvar_t	z_attach_cv;
+	kmutex_t	z_attach_lock;
 #endif
 
 	boolean_t	z_is_stale;	/* are we stale due to rollback? */
@@ -418,8 +421,8 @@ extern void	zfs_znode_init(void);
 extern void	zfs_znode_fini(void);
 
 #define ZGET_FLAG_UNLINKED          (1<<0) /* Also lookup unlinked */
-#define ZGET_FLAG_WITHOUT_VNODE     (1<<1) /* Don't attach vnode */
-#define ZGET_FLAG_WITHOUT_VNODE_GET (1<<2) /* Don't attach vnode + vnode_get*/
+#define ZGET_FLAG_ASYNC				(1<<3) /* taskq the vnode_create call */
+
 extern int zfs_zget(zfsvfs_t *zfsvfs, uint64_t obj_num, znode_t **zpp);
 extern int zfs_zget_ext(zfsvfs_t *zfsvfs, uint64_t obj_num, znode_t **zpp, int flags);
 #define zfs_zget(A,B,C) zfs_zget_ext((A),(B),(C),0)
@@ -523,6 +526,7 @@ extern void znode_stalker_fini(znode_t *zp);
 #endif /* _KERNEL */
 
 extern int zfs_obj_to_path(objset_t *osp, uint64_t obj, char *buf, int len);
+
 
 #ifdef	__cplusplus
 }

@@ -47,7 +47,7 @@ typedef struct abd {
 	kmutex_t        abd_mutex;
 	hrtime_t        abd_create_time;
 	struct abd	*abd_parent;
-	refcount_t	abd_children;
+	zfs_refcount_t	abd_children;
 	union {
 		struct abd_scatter {
 			uint_t	abd_offset;
@@ -113,6 +113,15 @@ void abd_copy_to_buf_off(void *, abd_t *, size_t, size_t);
 int abd_cmp(abd_t *, abd_t *, size_t);
 int abd_cmp_buf_off(abd_t *, const void *, size_t, size_t);
 void abd_zero_off(abd_t *, size_t, size_t);
+
+void abd_raidz_gen_iterate(abd_t **cabds, abd_t *dabd,
+        ssize_t csize, ssize_t dsize, const unsigned parity,
+        void (*func_raidz_gen)(void **, const void *, size_t, size_t));
+void abd_raidz_rec_iterate(abd_t **cabds, abd_t **tabds,
+        ssize_t tsize, const unsigned parity,
+        void (*func_raidz_rec)(void **t, const size_t tsize, void **c,
+        const unsigned *mul),
+        const unsigned *mul);
 
 /*
  * Wrappers for calls with offsets of 0

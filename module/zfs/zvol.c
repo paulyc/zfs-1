@@ -28,6 +28,9 @@
  *
  * Portions Copyright 2013 Jorgen Lundman
  *
+ * Copyright 2014 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2016 Actifio, Inc. All rights reserved.
+ * Copyright (c) 2012, 2019 by Delphix. All rights reserved.
  */
 
 /*
@@ -103,7 +106,6 @@ extern int zfs_bmajor;
  */
 
 void *zfsdev_state;
-static char *zvol_tag = "zvol_tag";
 
 #define	ZVOL_DUMPSIZE		"dumpsize"
 
@@ -149,7 +151,7 @@ static void zvol_log_truncate(zvol_state_t *zv, dmu_tx_t *tx, uint64_t off,
     uint64_t len, boolean_t sync);
 static int zvol_remove_zv(zvol_state_t *);
 static int zvol_get_data(void *arg, lr_write_t *lr, char *buf,
-	struct lwb *lwb, zio_t *zio, znode_t *zp, rl_t *rl);
+	struct lwb *lwb, zio_t *zio);
 // static int zvol_dumpify(zvol_state_t *zv);
 // static int zvol_dump_fini(zvol_state_t *zv);
 // static int zvol_dump_init(zvol_state_t *zv, boolean_t resize);
@@ -208,23 +210,25 @@ int
 zvol_get_stats(objset_t *os, nvlist_t *nv)
 {
 	int error;
-	dmu_object_info_t doi;
+	dmu_object_info_t *doi;
 	uint64_t val;
 
 	error = zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &val);
 	if (error)
-		return (error);
+		return (SET_ERROR(error));
 
 	dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_VOLSIZE, val);
-
-	error = dmu_object_info(os, ZVOL_OBJ, &doi);
+	doi = kmem_alloc(sizeof (dmu_object_info_t), KM_SLEEP);
+	error = dmu_object_info(os, ZVOL_OBJ, doi);
 
 	if (error == 0) {
 		dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_VOLBLOCKSIZE,
-		    doi.doi_data_block_size);
+		    doi->doi_data_block_size);
 	}
 
-	return (error);
+	kmem_free(doi, sizeof (dmu_object_info_t));
+
+	return (SET_ERROR(error));
 }
 
 static zvol_state_t *
@@ -551,7 +555,7 @@ zvol_create_minor_impl(const char *name)
 		return (error);
 	}
 	if (dmu_objset_type(os) != DMU_OST_ZVOL) {
-		printf("%s: dataset '%s' not ZVOL -- ignoring\n",
+		dprintf("%s: dataset '%s' not ZVOL -- ignoring\n",
 			__func__, name);
 		dmu_objset_rele(os, FTAG);
 		return 0;
@@ -616,12 +620,9 @@ zvol_create_minor_impl(const char *name)
 	zv->zv_objset = os;
 	if (dmu_objset_is_snapshot(os) || !spa_writeable(dmu_objset_spa(os)))
 		zv->zv_flags |= ZVOL_RDONLY;
-	mutex_init(&zv->zv_znode.z_range_lock, NULL, MUTEX_DEFAULT, NULL);
-	avl_create(&zv->zv_znode.z_range_avl, zfs_range_compare,
-	    sizeof (rl_t), offsetof(rl_t, r_node));
 	list_create(&zv->zv_extents, sizeof (zvol_extent_t),
 	    offsetof(zvol_extent_t, ze_node));
-	zv->zv_znode.z_is_zvol = 1;
+	rangelock_init(&zv->zv_rangelock, NULL, NULL);
 
 	/* get and cache the blocksize */
 	error = dmu_object_info(os, ZVOL_OBJ, &doi);
@@ -691,6 +692,87 @@ zvol_is_zvol(const char *device)
 	return (B_FALSE);
 }
 
+/* ARGSUSED */
+static void
+zvol_get_done(zgd_t *zgd, int error)
+{
+	if (zgd->zgd_db)
+		dmu_buf_rele(zgd->zgd_db, zgd);
+
+	rangelock_exit(zgd->zgd_lr);
+
+	kmem_free(zgd, sizeof (zgd_t));
+}
+
+/*
+ * Get data to generate a TX_WRITE intent log record.
+ */
+static int
+zvol_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb, zio_t *zio)
+{
+	zvol_state_t *zv = arg;
+	objset_t *os = zv->zv_objset;
+	uint64_t object = ZVOL_OBJ;
+	uint64_t offset = lr->lr_offset;
+	uint64_t size = lr->lr_length;
+	dmu_buf_t *db;
+	zgd_t *zgd;
+	int error;
+
+	ASSERT3P(lwb, !=, NULL);
+	ASSERT3P(zio, !=, NULL);
+	ASSERT3U(size, !=, 0);
+
+	zgd = (zgd_t *)kmem_zalloc(sizeof (zgd_t), KM_SLEEP);
+	zgd->zgd_lwb = lwb;
+
+	/*
+	 * Write records come in two flavors: immediate and indirect.
+	 * For small writes it's cheaper to store the data with the
+	 * log record (immediate); for large writes it's cheaper to
+	 * sync the data and get a pointer to it (indirect) so that
+	 * we don't have to write the data twice.
+	 */
+	if (buf != NULL) { /* immediate write */
+		zgd->zgd_lr = rangelock_enter(&zv->zv_rangelock, offset, size,
+		    RL_READER);
+		error = dmu_read(os, object, offset, size, buf,
+			DMU_READ_NO_PREFETCH);
+	} else { /* indirect write */
+		/*
+		 * Have to lock the whole block to ensure when it's written out
+		 * and its checksum is being calculated that no one can change
+		 * the data. Contrarily to zfs_get_data we need not re-check
+		 * blocksize after we get the lock because it cannot be changed.
+		 */
+		size = zv->zv_volblocksize;
+		offset = P2ALIGN_TYPED(offset, size, uint64_t);
+		zgd->zgd_lr = rangelock_enter(&zv->zv_rangelock, offset, size,
+		    RL_READER);
+		error = dmu_buf_hold(os, object, offset, zgd, &db,
+			DMU_READ_NO_PREFETCH);
+		if (error == 0) {
+			blkptr_t *bp = &lr->lr_blkptr;
+
+			zgd->zgd_db = db;
+			zgd->zgd_bp = bp;
+
+			ASSERT(db != NULL);
+			ASSERT(db->db_offset == offset);
+			ASSERT(db->db_size == size);
+
+			error = dmu_sync(zio, lr->lr_common.lrc_txg,
+			    zvol_get_done, zgd);
+
+			if (error == 0)
+				return (0);
+		}
+	}
+
+	zvol_get_done(zgd, error);
+
+	return (SET_ERROR(error));
+}
 
 /*
  * Remove minor node for the specified volume.
@@ -723,8 +805,7 @@ zvol_remove_zv(zvol_state_t *zv)
 
 	zv->zv_iokitdev = NULL;
 
-	avl_destroy(&zv->zv_znode.z_range_avl);
-	mutex_destroy(&zv->zv_znode.z_range_lock);
+	rangelock_fini(&zv->zv_rangelock);
 
 	kmem_free(zv, sizeof (zvol_state_t));
 
@@ -885,6 +966,107 @@ zvol_create_minors_cb(const char *dsname, void *arg)
 	return (0);
 }
 
+/*
+ * Shutdown every zv_objset related stuff except zv_objset itself.
+ * The is the reverse of zvol_setup_zv.
+ */
+static void
+zvol_shutdown_zv(zvol_state_t *zv)
+{
+	//ASSERT(MUTEX_HELD(&zv->zv_state_lock) &&
+	//    RW_LOCK_HELD(&zv->zv_suspend_lock));
+
+	if (zv->zv_flags & ZVOL_WRITTEN_TO) {
+		ASSERT(zv->zv_zilog != NULL);
+		zil_close(zv->zv_zilog);
+	}
+
+	zv->zv_zilog = NULL;
+
+#ifdef linux
+	dnode_rele(zv->zv_dn, FTAG);
+	zv->zv_dn = NULL;
+#else
+#endif
+
+	/*
+	 * Evict cached data. We must write out any dirty data before
+	 * disowning the dataset.
+	 */
+	if (zv->zv_flags & ZVOL_WRITTEN_TO)
+		txg_wait_synced(dmu_objset_pool(zv->zv_objset), 0);
+	(void) dmu_objset_evict_dbufs(zv->zv_objset);
+}
+
+/*
+ * return the proper tag for rollback and recv
+ */
+void *
+zvol_tag(zvol_state_t *zv)
+{
+	//ASSERT(RW_WRITE_HELD(&zv->zv_suspend_lock));
+	return (zv->zv_open_count > 0 ? zv : NULL);
+}
+
+/*
+ * Suspend the zvol for recv and rollback.
+ */
+zvol_state_t *
+zvol_suspend(const char *name)
+{
+	zvol_state_t *zv;
+
+#ifdef linux
+	zv = zvol_find_by_name(name, RW_WRITER);
+#else
+	mutex_enter(&zfsdev_state_lock);
+	zv = zvol_minor_lookup(name);
+	mutex_exit(&zfsdev_state_lock);
+#endif
+	if (zv == NULL)
+		return (NULL);
+
+#ifdef linux
+	/* block all I/O, release in zvol_resume. */
+	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
+
+	atomic_inc(&zv->zv_suspend_ref);
+#endif
+
+	if (zv->zv_open_count > 0)
+		zvol_shutdown_zv(zv);
+
+#ifdef linux
+	/*
+	 * do not hold zv_state_lock across suspend/resume to
+	 * avoid locking up zvol lookups
+	 */
+	mutex_exit(&zfsdev_state_lock);
+#endif
+
+	/* zv_suspend_lock is released in zvol_resume() */
+	return (zv);
+}
+
+int
+zvol_resume(zvol_state_t *zv)
+{
+	int error = 0;
+
+	mutex_enter(&zfsdev_state_lock);
+
+	if (zv->zv_open_count > 0) {
+		VERIFY0(dmu_objset_hold(zv->zv_name, zv, &zv->zv_objset));
+		VERIFY3P(zv->zv_objset->os_dsl_dataset->ds_owner, ==, zv);
+		VERIFY(dsl_dataset_long_held(zv->zv_objset->os_dsl_dataset));
+		dmu_objset_rele(zv->zv_objset, zv);
+
+	}
+
+	mutex_exit(&zfsdev_state_lock);
+
+	return (SET_ERROR(error));
+}
 
 int
 zvol_first_open(zvol_state_t *zv)
@@ -897,6 +1079,9 @@ zvol_first_open(zvol_state_t *zv)
 	dprintf("zvol_first_open: '%s'\n", zv->zv_name);
 
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
+
+	zv->zv_zilog = NULL;
+	zv->zv_flags &= ~ZVOL_WRITTEN_TO;
 
 	/* lie and say we're read-only */
 	error = dmu_objset_own(zv->zv_name, DMU_OST_ZVOL, B_TRUE,
@@ -928,7 +1113,6 @@ zvol_first_open(zvol_state_t *zv)
 	}
 
 	zvol_size_changed(zv, volsize);
-	zv->zv_zilog = zil_open(os, zvol_get_data);
 
 	if (readonly || dmu_objset_is_snapshot(os) ||
 	    !spa_writeable(dmu_objset_spa(os)))
@@ -1795,82 +1979,6 @@ zvol_close(dev_t dev, int flag, int otyp, struct proc *p)
 	return (zvol_close_impl(zv, flag, otyp, p));
 }
 
-static void
-zvol_get_done(zgd_t *zgd, int error)
-{
-	if (zgd->zgd_db)
-		dmu_buf_rele(zgd->zgd_db, zgd);
-
-	zfs_range_unlock(zgd->zgd_rl);
-
-	if (error == 0 && zgd->zgd_bp)
-		zil_lwb_add_block(zgd->zgd_lwb, zgd->zgd_bp);
-
-	kmem_free(zgd, sizeof (zgd_t));
-}
-
-/*
- * Get data to generate a TX_WRITE intent log record.
- */
-static int
-zvol_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb,
-	zio_t *zio, znode_t *zp, rl_t *rl)
-{
-	zvol_state_t *zv = arg;
-	objset_t *os = zv->zv_objset;
-	uint64_t object = ZVOL_OBJ;
-	uint64_t offset = lr->lr_offset;
-	uint64_t size = lr->lr_length;	/* length of user data */
-	dmu_buf_t *db;
-	zgd_t *zgd;
-	int error;
-
-	ASSERT3P(lwb, !=, NULL);
-	ASSERT3P(zio, !=, NULL);
-	ASSERT3U(size, !=, 0);
-
-	zgd = kmem_zalloc(sizeof (zgd_t), KM_SLEEP);
-	zgd->zgd_lwb = lwb;
-	zgd->zgd_rl = rl;
-	//zgd->zgd_rl = zfs_range_lock(&zv->zv_znode, offset, size, RL_READER);
-
-	/*
-	 * Write records come in two flavors: immediate and indirect.
-	 * For small writes it's cheaper to store the data with the
-	 * log record (immediate); for large writes it's cheaper to
-	 * sync the data and get a pointer to it (indirect) so that
-	 * we don't have to write the data twice.
-	 */
-	if (buf != NULL) {	/* immediate write */
-		error = dmu_read(os, object, offset, size, buf,
-		    DMU_READ_NO_PREFETCH);
-	} else {
-		size = zv->zv_volblocksize;
-		offset = P2ALIGN(offset, size);
-		error = dmu_buf_hold(os, object, offset, zgd, &db,
-		    DMU_READ_NO_PREFETCH);
-		if (error == 0) {
-			blkptr_t *bp = &lr->lr_blkptr;
-
-			zgd->zgd_db = db;
-			zgd->zgd_bp = bp;
-
-			ASSERT(db->db_offset == offset);
-			ASSERT(db->db_size == size);
-
-			error = dmu_sync(zio, lr->lr_common.lrc_txg,
-			    zvol_get_done, zgd);
-
-			if (error == 0)
-				return (0);
-		}
-	}
-
-	zvol_get_done(zgd, error);
-
-	return (error);
-}
-
 /*
  * zvol_log_write() handles synchronous writes using TX_WRITE ZIL transactions.
  *
@@ -2049,7 +2157,7 @@ zvol_strategy(struct buf *bp)
 	size_t resid;
 	char *addr;
 	objset_t *os;
-	rl_t *rl;
+	locked_range_t *lr;
 	int error = 0;
 	boolean_t doread = buf_flags(bp) & B_READ;
 	boolean_t is_dump;
@@ -2116,7 +2224,7 @@ zvol_strategy(struct buf *bp)
 	 * There must be no buffer changes when doing a dmu_sync() because
 	 * we can't change the data whilst calculating the checksum.
 	 */
-	rl = zfs_range_lock(&zv->zv_znode, off, resid,
+	lr = rangelock_enter(&zv->zv_rangelock, off, resid,
 	    doread ? RL_READER : RL_WRITER);
 
 	while (resid != 0 && off < volsize) {
@@ -2150,7 +2258,7 @@ zvol_strategy(struct buf *bp)
 		addr += size;
 		resid -= size;
 	}
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 
 	buf_setresid(bp, resid);
 	if (buf_resid(bp) == buf_count(bp))
@@ -2220,7 +2328,7 @@ zvol_read(dev_t dev, struct uio *uio, int p)
 	minor_t minor = getminor(dev);
 	zvol_state_t *zv;
 	uint64_t volsize;
-	rl_t *rl;
+	locked_range_t *lr;
 	int error = 0;
 
 	zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
@@ -2241,7 +2349,7 @@ zvol_read(dev_t dev, struct uio *uio, int p)
 	}
 #endif
 
-	rl = zfs_range_lock(&zv->zv_znode, uio_offset(uio), uio_resid(uio),
+	lr = rangelock_enter(&zv->zv_rangelock, uio_offset(uio), uio_resid(uio),
 	    RL_READER);
 	while (uio_resid(uio) > 0 && uio_offset(uio) < volsize) {
 		uint64_t bytes = MIN(uio_resid(uio), DMU_MAX_ACCESS >> 1);
@@ -2258,7 +2366,7 @@ zvol_read(dev_t dev, struct uio *uio, int p)
 			break;
 		}
 	}
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 	return (error);
 }
 
@@ -2269,7 +2377,7 @@ zvol_write(dev_t dev, struct uio *uio, int p)
 	minor_t minor = getminor(dev);
 	zvol_state_t *zv;
 	uint64_t volsize;
-	rl_t *rl;
+	locked_range_t *lr;
 	int error = 0;
 	boolean_t sync;
 
@@ -2291,10 +2399,24 @@ zvol_write(dev_t dev, struct uio *uio, int p)
 	}
 #endif
 
+	/*
+	 * Open a ZIL if this is the first time we have written to this
+	 * zvol.
+	 */
+	if (zv->zv_zilog == NULL) {
+		mutex_enter(&zfsdev_state_lock);
+		if (zv->zv_zilog == NULL) {
+			zv->zv_zilog = zil_open(zv->zv_objset,
+				zvol_get_data);
+			zv->zv_flags |= ZVOL_WRITTEN_TO;
+		}
+		mutex_exit(&zfsdev_state_lock);
+	}
+
 	sync = !(zv->zv_flags & ZVOL_WCE) ||
 	    (zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS);
 
-	rl = zfs_range_lock(&zv->zv_znode, uio_offset(uio), uio_resid(uio),
+	lr = rangelock_enter(&zv->zv_rangelock, uio_offset(uio), uio_resid(uio),
 	    RL_WRITER);
 	while (uio_resid(uio) > 0 && uio_offset(uio) < volsize) {
 		uint64_t bytes = MIN(uio_resid(uio), DMU_MAX_ACCESS >> 1);
@@ -2318,7 +2440,7 @@ zvol_write(dev_t dev, struct uio *uio, int p)
 		if (error)
 			break;
 	}
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 	if (sync)
 		zil_commit(zv->zv_zilog, ZVOL_OBJ);
 	return (error);
@@ -2333,7 +2455,7 @@ zvol_read_iokit(zvol_state_t *zv, uint64_t position,
     uint64_t count, struct iomem *iomem)
 {
 	uint64_t volsize;
-	rl_t *rl;
+	locked_range_t *lr;
 	int error = 0;
 	uint64_t offset = 0;
 
@@ -2353,7 +2475,7 @@ zvol_read_iokit(zvol_state_t *zv, uint64_t position,
 	}
 #endif
 
-	rl = zfs_range_lock(&zv->zv_znode, position, count,
+	lr = rangelock_enter(&zv->zv_rangelock, position, count,
 	    RL_READER);
 	while (count > 0 && (position+offset) < volsize) {
 		uint64_t bytes = MIN(count, DMU_MAX_ACCESS >> 1);
@@ -2377,7 +2499,7 @@ zvol_read_iokit(zvol_state_t *zv, uint64_t position,
 		}
 		count -= MIN(count, DMU_MAX_ACCESS >> 1) - bytes;
 	}
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 
 	return (error);
 }
@@ -2393,7 +2515,7 @@ zvol_write_iokit(zvol_state_t *zv, uint64_t position,
     uint64_t count, struct iomem *iomem)
 {
 	uint64_t volsize;
-	rl_t *rl;
+	locked_range_t *lr;
 	int error = 0;
 	boolean_t sync;
 	uint64_t offset = 0;
@@ -2423,7 +2545,7 @@ zvol_write_iokit(zvol_state_t *zv, uint64_t position,
 	    (zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS);
 
 	/* Lock the entire range */
-	rl = zfs_range_lock(&zv->zv_znode, position, count,
+	lr = rangelock_enter(&zv->zv_rangelock, position, count,
 	    RL_WRITER);
 	/* Iterate over (DMU_MAX_ACCESS/2) segments */
 	while (count > 0 && (position + offset) < volsize) {
@@ -2456,7 +2578,7 @@ zvol_write_iokit(zvol_state_t *zv, uint64_t position,
 		if (error)
 			break;
 	}
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 
 	if (sync)
 		zil_commit(zv->zv_zilog, ZVOL_OBJ);
@@ -2468,8 +2590,8 @@ int
 zvol_unmap(zvol_state_t *zv, uint64_t off, uint64_t bytes)
 {
 //#define VERBOSE_UNMAP
-	rl_t *rl = 0;
-	dmu_tx_t *tx = 0;
+	locked_range_t *lr = NULL;
+	dmu_tx_t *tx = NULL;
 	int error = 0;
 	uint64_t end = off + bytes;
 #ifdef VERBOSE_UNMAP
@@ -2519,7 +2641,7 @@ zvol_unmap(zvol_state_t *zv, uint64_t off, uint64_t bytes)
 	    off, end, bytes);
 #endif
 
-	rl = zfs_range_lock(&zv->zv_znode, off, bytes, RL_WRITER);
+	lr = rangelock_enter(&zv->zv_rangelock, off, bytes, RL_WRITER);
 
 	tx = dmu_tx_create(zv->zv_objset);
 
@@ -2539,7 +2661,7 @@ zvol_unmap(zvol_state_t *zv, uint64_t off, uint64_t bytes)
 		    ZVOL_OBJ, off, bytes);
 	}
 
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 
 	if (error == 0) {
 		/*
@@ -2643,7 +2765,7 @@ zvol_get_volume_params(minor_t minor, uint64_t *blksize,
 	*minor_hdl = zv;
 	*objset_hdl = zv->zv_objset;
 	*zil_hdl = zv->zv_zilog;
-	*rl_hdl = &zv->zv_znode;
+	*rl_hdl = NULL;
 	*bonus_hdl = zv->zv_dbuf;
 	return (0);
 }

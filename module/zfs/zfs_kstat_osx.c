@@ -147,31 +147,59 @@ osx_kstat_t osx_kstat = {
 
 	{"zfs_recover",					KSTAT_DATA_INT64  },
 
-	{"zfs_free_bpobj_enabled",			KSTAT_DATA_INT64  },
+	{"zfs_free_bpobj_enabled",		KSTAT_DATA_INT64  },
 
 	{"zfs_send_corrupt_data",		KSTAT_DATA_UINT64  },
 	{"zfs_send_queue_length",		KSTAT_DATA_UINT64  },
 	{"zfs_recv_queue_length",		KSTAT_DATA_UINT64  },
 
-	{"zvol_inhibit_dev",KSTAT_DATA_UINT64  },
+	{"zvol_inhibit_dev",			KSTAT_DATA_UINT64  },
 	{"zfs_send_set_freerecords_bit",KSTAT_DATA_UINT64  },
 
 	{"zfs_write_implies_delete_child",KSTAT_DATA_UINT64  },
 	{"zfs_send_holes_without_birth_time",KSTAT_DATA_UINT64  },
 
-	{"dbuf_cache_max_bytes",KSTAT_DATA_UINT64  },
+	{"dbuf_cache_max_bytes",		KSTAT_DATA_UINT64  },
 
-	{"zfs_vdev_queue_depth_pct",KSTAT_DATA_UINT64  },
-	{"zio_dva_throttle_enabled",KSTAT_DATA_UINT64  },
+	{"zfs_vdev_queue_depth_pct",	KSTAT_DATA_UINT64  },
+	{"zio_dva_throttle_enabled",	KSTAT_DATA_UINT64  },
 
 	{"zfs_vdev_file_size_mismatch_cnt",KSTAT_DATA_UINT64  },
 
-	{"zfs_lua_max_instrlimit",KSTAT_DATA_UINT64  },
-	{"zfs_lua_max_memlimit",KSTAT_DATA_UINT64  },
+	{"zfs_lua_max_instrlimit",		KSTAT_DATA_UINT64  },
+	{"zfs_lua_max_memlimit",		KSTAT_DATA_UINT64  },
+
+	{"zfs_trim_extent_bytes_max",	KSTAT_DATA_UINT64  },
+	{"zfs_trim_extent_bytes_min",	KSTAT_DATA_UINT64  },
+	{"zfs_trim_metaslab_skip",		KSTAT_DATA_UINT64  },
+	{"zfs_trim_txg_batch",			KSTAT_DATA_UINT64  },
+	{"zfs_trim_queue_limit",		KSTAT_DATA_UINT64  },
+
+	{"zfs_send_unmodified_spill_blocks",		KSTAT_DATA_UINT64  },
+	{"zfs_special_class_metadata_reserve_pct",		KSTAT_DATA_UINT64  },
+
+	{"zfs_vdev_raidz_impl",		KSTAT_DATA_STRING  },
+	{"icp_gcm_impl",		KSTAT_DATA_STRING  },
+	{"icp_aes_impl",		KSTAT_DATA_STRING  },
+	{"zfs_fletcher_4_impl",		KSTAT_DATA_STRING  },
+
 };
 
 
+extern void kstat_named_setstr(kstat_named_t *knp, const char *src);
+extern int zfs_vdev_raidz_impl_set(const char *val);
+extern int zfs_vdev_raidz_impl_get(char *buffer, int max);
+extern int icp_gcm_impl_set(const char *val);
+extern int icp_gcm_impl_get(char *buffer, int max);
+extern int icp_aes_impl_set(const char *val);
+extern int icp_aes_impl_get(char *buffer, int max);
+extern int zfs_fletcher_4_impl_set(const char *val);
+extern int zfs_fletcher_4_impl_get(char *buffer, int max);
 
+static char vdev_raidz_string[80] = { 0 };
+static char icp_gcm_string[80] = { 0 };
+static char icp_aes_string[80] = { 0 };
+static char zfs_fletcher_4_string[80] = { 0 };
 
 static kstat_t		*osx_kstat_ksp;
 
@@ -352,7 +380,39 @@ static int osx_kstat_update(kstat_t *ksp, int rw)
 		    ks->zfs_lua_max_instrlimit.value.ui64;
 		zfs_lua_max_memlimit =
 		    ks->zfs_lua_max_memlimit.value.ui64;
-} else {
+
+		zfs_trim_extent_bytes_max =
+			ks->zfs_trim_extent_bytes_max.value.ui64;
+		zfs_trim_extent_bytes_min =
+			ks->zfs_trim_extent_bytes_min.value.ui64;
+		zfs_trim_metaslab_skip =
+			ks->zfs_trim_metaslab_skip.value.ui64;
+		zfs_trim_txg_batch =
+			ks->zfs_trim_txg_batch.value.ui64;
+		zfs_trim_queue_limit =
+			ks->zfs_trim_queue_limit.value.ui64;
+
+		zfs_send_unmodified_spill_blocks =
+			ks->zfs_send_unmodified_spill_blocks.value.ui64;
+		zfs_special_class_metadata_reserve_pct =
+			ks->zfs_special_class_metadata_reserve_pct.value.ui64;
+
+		// Check if string has changed (from KREAD), if so, update.
+		if (strcmp(vdev_raidz_string,
+				ks->zfs_vdev_raidz_impl.value.string.addr.ptr) != 0)
+			zfs_vdev_raidz_impl_set(ks->zfs_vdev_raidz_impl.value.string.addr.ptr);
+
+		if (strcmp(icp_gcm_string, ks->icp_gcm_impl.value.string.addr.ptr) != 0)
+			icp_gcm_impl_set(ks->icp_gcm_impl.value.string.addr.ptr);
+
+		if (strcmp(icp_aes_string, ks->icp_aes_impl.value.string.addr.ptr) != 0)
+			icp_aes_impl_set(ks->icp_aes_impl.value.string.addr.ptr);
+
+		if (strcmp(zfs_fletcher_4_string,
+				ks->zfs_fletcher_4_impl.value.string.addr.ptr) != 0)
+			zfs_fletcher_4_impl_set(ks->zfs_fletcher_4_impl.value.string.addr.ptr);
+
+	} else {
 
 		/* kstat READ */
 		ks->spa_version.value.ui64                   = SPA_VERSION;
@@ -519,6 +579,36 @@ static int osx_kstat_update(kstat_t *ksp, int rw)
 
 		ks->zfs_lua_max_instrlimit.value.ui64 = zfs_lua_max_instrlimit;
 		ks->zfs_lua_max_memlimit.value.ui64 = zfs_lua_max_memlimit;
+
+		ks->zfs_trim_extent_bytes_max.value.ui64 =
+			zfs_trim_extent_bytes_max;
+		ks->zfs_trim_extent_bytes_min.value.ui64 =
+			zfs_trim_extent_bytes_min;
+		ks->zfs_trim_metaslab_skip.value.ui64 =
+			zfs_trim_metaslab_skip;
+		ks->zfs_trim_txg_batch.value.ui64 =
+			zfs_trim_txg_batch;
+		ks->zfs_trim_queue_limit.value.ui64 =
+			zfs_trim_queue_limit;
+
+		ks->zfs_send_unmodified_spill_blocks.value.ui64 =
+			zfs_send_unmodified_spill_blocks;
+		ks->zfs_special_class_metadata_reserve_pct.value.ui64 =
+			zfs_special_class_metadata_reserve_pct;
+
+		zfs_vdev_raidz_impl_get(vdev_raidz_string, sizeof(vdev_raidz_string));
+		kstat_named_setstr(&ks->zfs_vdev_raidz_impl, vdev_raidz_string);
+
+		icp_gcm_impl_get(icp_gcm_string, sizeof(icp_gcm_string));
+		kstat_named_setstr(&ks->icp_gcm_impl, icp_gcm_string);
+
+		icp_aes_impl_get(icp_aes_string, sizeof(icp_aes_string));
+		kstat_named_setstr(&ks->icp_aes_impl, icp_aes_string);
+
+		zfs_fletcher_4_impl_get(zfs_fletcher_4_string,
+			sizeof(zfs_fletcher_4_string));
+		kstat_named_setstr(&ks->zfs_fletcher_4_impl, zfs_fletcher_4_string);
+
 	}
 
 	return 0;

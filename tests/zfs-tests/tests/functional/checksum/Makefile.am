@@ -1,6 +1,7 @@
 include $(top_srcdir)/config/Rules.am
-AM_CPPFLAGS += -I$(top_srcdir)/include
-LDADD = $(top_srcdir)/lib/libicp/libicp.la
+
+AM_CPPFLAGS += -I$(top_srcdir)/../include
+LDADD = $(top_srcdir)/../lib/libicp/libicp.la
 
 AUTOMAKE_OPTIONS = subdir-objects
 
@@ -11,7 +12,11 @@ dist_pkgdata_SCRIPTS = \
 	cleanup.ksh \
 	run_edonr_test.ksh \
 	run_sha2_test.ksh \
-	run_skein_test.ksh
+	run_skein_test.ksh \
+	filetest_001_pos.ksh
+
+dist_pkgdata_DATA = \
+	default.cfg
 
 pkgexecdir = $(datadir)/@PACKAGE@/zfs-tests/tests/functional/checksum
 

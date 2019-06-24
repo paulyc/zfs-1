@@ -31,7 +31,7 @@
 #include <sys/dmu.h>
 #include <sys/dmu_tx.h>
 #include <sys/dmu_objset.h>
-#include <sys/dmu_send.h>
+#include <sys/dmu_recv.h>
 #include <sys/dsl_dataset.h>
 #include <sys/spa.h>
 #include <sys/range_tree.h>
@@ -378,8 +378,17 @@ dnode_sync_free_range_impl(dnode_t *dn, uint64_t blkid, uint64_t nblks,
 
 	/*
 	 * Do not truncate the maxblkid if we are performing a raw
-	 * receive. The raw receive sets the mablkid manually and
-	 * must not be overriden.
+	 * receive. The raw receive sets the maxblkid manually and
+	 * must not be overridden. Usually, the last DRR_FREE record
+	 * will be at the maxblkid, because the source system sets
+	 * the maxblkid when truncating. However, if the last block
+	 * was freed by overwriting with zeros and being compressed
+	 * away to a hole, the source system will generate a DRR_FREE
+	 * record while leaving the maxblkid after the end of that
+	 * record. In this case we need to leave the maxblkid as
+	 * indicated in the DRR_OBJECT record, so that it matches the
+	 * source system, ensuring that the cryptographic hashes will
+	 * match.
 	 */
 	if (trunc && !dn->dn_objset->os_raw_receive) {
 		ASSERTV(uint64_t off);
@@ -433,13 +442,26 @@ dnode_evict_dbufs(dnode_t *dn)
 
 		mutex_enter(&db->db_mtx);
 		if (db->db_state != DB_EVICTING &&
-		    refcount_is_zero(&db->db_holds)) {
+		    zfs_refcount_is_zero(&db->db_holds)) {
 			db_marker->db_level = db->db_level;
 			db_marker->db_blkid = db->db_blkid;
 			db_marker->db_state = DB_SEARCH;
 			avl_insert_here(&dn->dn_dbufs, db_marker, db,
 			    AVL_BEFORE);
 
+			/*
+			 * We need to use the "marker" dbuf rather than
+			 * simply getting the next dbuf, because
+			 * dbuf_destroy() may actually remove multiple dbufs.
+			 * It can call itself recursively on the parent dbuf,
+			 * which may also be removed from dn_dbufs.  The code
+			 * flow would look like:
+			 *
+			 * dbuf_destroy():
+			 *   dnode_rele_and_unlock(parent_dbuf, evicting=TRUE):
+			 *	if (!cacheable || pending_evict)
+			 *	  dbuf_destroy()
+			 */
 			dbuf_destroy(db);
 
 			db_next = AVL_NEXT(&dn->dn_dbufs, db_marker);
@@ -462,7 +484,7 @@ dnode_evict_bonus(dnode_t *dn)
 {
 	rw_enter(&dn->dn_struct_rwlock, RW_WRITER);
 	if (dn->dn_bonus != NULL) {
-		if (refcount_is_zero(&dn->dn_bonus->db_holds)) {
+		if (zfs_refcount_is_zero(&dn->dn_bonus->db_holds)) {
 			mutex_enter(&dn->dn_bonus->db_mtx);
 			dbuf_destroy(dn->dn_bonus);
 			dn->dn_bonus = NULL;
@@ -500,7 +522,7 @@ dnode_undirty_dbufs(list_t *list)
 			list_destroy(&dr->dt.di.dr_children);
 		}
 		kmem_free(dr, sizeof (dbuf_dirty_record_t));
-		dbuf_rele_and_unlock(db, (void *)(uintptr_t)txg);
+		dbuf_rele_and_unlock(db, (void *)(uintptr_t)txg, B_FALSE);
 	}
 }
 
@@ -528,7 +550,7 @@ dnode_sync_free(dnode_t *dn, dmu_tx_t *tx)
 	 * zfs_obj_to_path() also depends on this being
 	 * commented out.
 	 *
-	 * ASSERT3U(refcount_count(&dn->dn_holds), ==, 1);
+	 * ASSERT3U(zfs_refcount_count(&dn->dn_holds), ==, 1);
 	 */
 
 	/* Undirty next bits */
@@ -738,11 +760,13 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 
 	/*
 	 * This must be done after dnode_sync_free_range()
-	 * and dnode_increase_indirection().
+	 * and dnode_increase_indirection(). See dnode_new_blkid()
+	 * for an explanation of the high bit being set.
 	 */
 	if (dn->dn_next_maxblkid[txgoff]) {
 		mutex_enter(&dn->dn_mtx);
-		dnp->dn_maxblkid = dn->dn_next_maxblkid[txgoff];
+		dnp->dn_maxblkid =
+		    dn->dn_next_maxblkid[txgoff] & ~DMU_NEXT_MAXBLKID_SET;
 		dn->dn_next_maxblkid[txgoff] = 0;
 		mutex_exit(&dn->dn_mtx);
 	}

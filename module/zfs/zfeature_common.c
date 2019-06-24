@@ -304,8 +304,21 @@ zpool_feature_init(void)
 	    ZFEATURE_FLAG_PER_DATASET, edonr_deps);
 
 	{
+	static const spa_feature_t bookmark_v2_deps[] = {
+		SPA_FEATURE_EXTENSIBLE_DATASET,
+		SPA_FEATURE_BOOKMARKS,
+		SPA_FEATURE_NONE
+	};
+	zfeature_register(SPA_FEATURE_BOOKMARK_V2,
+	    "com.datto:bookmark_v2", "bookmark_v2",
+	    "Support for larger bookmarks",
+	    ZFEATURE_FLAG_PER_DATASET, bookmark_v2_deps);
+	}
+
+	{
 	static const spa_feature_t encryption_deps[] = {
 		SPA_FEATURE_EXTENSIBLE_DATASET,
+		SPA_FEATURE_BOOKMARK_V2,
 		SPA_FEATURE_NONE
 	};
 	zfeature_register(SPA_FEATURE_ENCRYPTION,
@@ -334,4 +347,9 @@ zpool_feature_init(void)
 	    "Support for separate allocation classes.",
 	    ZFEATURE_FLAG_READONLY_COMPAT, NULL);
 	}
+
+	zfeature_register(SPA_FEATURE_RESILVER_DEFER,
+	    "com.datto:resilver_defer", "resilver_defer",
+	    "Support for defering new resilvers when one is already running.",
+	    ZFEATURE_FLAG_READONLY_COMPAT, /*ZFEATURE_TYPE_BOOLEAN,*/ NULL);
 }

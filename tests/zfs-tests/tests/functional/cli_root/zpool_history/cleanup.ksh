@@ -31,4 +31,6 @@
 
 . $STF_SUITE/include/libtest.shlib
 
+$SLEEP 5
 default_cleanup
+$ZPOOL export -fa

@@ -45,6 +45,7 @@
 #ifdef __APPLE__
 #include <sys/disk.h>
 #endif
+#include <zfs_fletcher.h>
 #include <sys/crypto/icp.h>
 
 /*
@@ -875,6 +876,30 @@ fop_getattr(vnode_t *vp, vattr_t *vap)
 	return (0);
 }
 
+int
+fop_space(
+	vnode_t *vp,
+	int cmd,
+	struct flock *fl,
+	int flag,
+	offset_t offset,
+	cred_t *cr,
+	void *ct)
+{
+#ifdef F_PUNCHHOLE
+	if (cmd == F_FREESP) {
+		fpunchhole_t fpht;
+		fpht.fp_flags = 0;
+		fpht.fp_offset = fl->l_start;
+		fpht.fp_length = fl->l_len;
+
+		if (fcntl(vp->v_fd, F_PUNCHHOLE, &fpht) == -1)
+			return (errno);
+	}
+#endif
+	return (0);
+}
+
 /*
  * =========================================================================
  * Figure out which debugging statements to print
@@ -975,7 +1000,8 @@ __dprintf(const char *file, const char *func, int line, const char *fmt, ...)
 		if (dprintf_find_string("pid"))
 			(void) printf("%d ", getpid());
 		if (dprintf_find_string("tid"))
-			(void) printf("%llu ", (uint64_t) pthread_self());
+			(void) printf("%ju ",
+			    (uintmax_t)(uintptr_t)pthread_self());
 		if (dprintf_find_string("cpu"))
 			(void) printf("%u ", getcpuid());
 		if (dprintf_find_string("time"))
@@ -1322,12 +1348,14 @@ kernel_init(int mode)
 
 	spa_init(mode);
 
+	fletcher_4_init();
 	//tsd_create(&rrw_tsd_key, rrw_tsd_destroy);
 }
 
 void
 kernel_fini(void)
 {
+	fletcher_4_fini();
 	spa_fini();
 
 	icp_fini();

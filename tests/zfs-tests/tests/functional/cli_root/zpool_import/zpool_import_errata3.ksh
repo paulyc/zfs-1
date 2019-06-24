@@ -62,7 +62,12 @@ log_assert "Verify that Errata 3 is properly handled"
 
 uncompress_pool
 log_must zpool import -d /$TESTPOOL/ $POOL_NAME
+<<<<<<< HEAD
 log_must eval "zpool status | grep -q Errata"
+=======
+log_must eval "zpool status $POOL_NAME | grep -q Errata" # also detects 'Errata #4'
+log_must eval "zpool status $POOL_NAME | grep -q ZFS-8000-ER"
+>>>>>>> f00ab3f22c... Detect and prevent mixed raw and non-raw sends
 log_must eval "echo 'password' | zfs load-key $POOL_NAME/testfs"
 log_must eval "echo 'password' | zfs load-key $POOL_NAME/testvol"
 
@@ -74,9 +79,12 @@ log_must eval "ls $old_mntpnt | grep -q testfile"
 block_device_wait
 log_mustnot dd if=/dev/zero of=/dev/zvol/$POOL_NAME/testvol bs=512 count=1
 log_must dd if=/dev/zvol/$POOL_NAME/testvol of=/dev/null bs=512 count=1
+
+log_must zpool set feature@bookmark_v2=enabled $POOL_NAME # necessary for Errata #4
+
 log_must eval "echo 'password' | zfs create \
 	-o encryption=on -o keyformat=passphrase -o keylocation=prompt \
-	cryptv0/encroot"
+	$POOL_NAME/encroot"
 log_mustnot eval "zfs send -w $POOL_NAME/testfs@snap1 | \
 	zfs recv $POOL_NAME/encroot/testfs"
 log_mustnot eval "zfs send -w $POOL_NAME/testvol@snap1 | \
@@ -95,5 +103,9 @@ log_must zfs destroy -r $POOL_NAME/testvol
 
 log_must zpool export $POOL_NAME
 log_must zpool import -d /$TESTPOOL/ $POOL_NAME
+<<<<<<< HEAD
 log_mustnot eval "zpool status | grep -q Errata"
+=======
+log_mustnot eval "zpool status $POOL_NAME | grep -q 'Errata #3'"
+>>>>>>> f00ab3f22c... Detect and prevent mixed raw and non-raw sends
 log_pass "Errata 3 is properly handled"

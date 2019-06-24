@@ -696,19 +696,20 @@ get_metaslab_refcount(vdev_t *vd)
 static int
 get_obsolete_refcount(vdev_t *vd)
 {
+	uint64_t obsolete_sm_object;
 	int refcount = 0;
 
-	uint64_t obsolete_sm_obj = vdev_obsolete_sm_object(vd);
-	if (vd->vdev_top == vd && obsolete_sm_obj != 0) {
+	VERIFY0(vdev_obsolete_sm_object(vd, &obsolete_sm_object));
+	if (vd->vdev_top == vd && obsolete_sm_object != 0) {
 		dmu_object_info_t doi;
 		VERIFY0(dmu_object_info(vd->vdev_spa->spa_meta_objset,
-		    obsolete_sm_obj, &doi));
+		    obsolete_sm_object, &doi));
 		if (doi.doi_bonus_size == sizeof (space_map_phys_t)) {
 			refcount++;
 		}
 	} else {
 		ASSERT3P(vd->vdev_obsolete_sm, ==, NULL);
-		ASSERT3U(obsolete_sm_obj, ==, 0);
+		ASSERT3U(obsolete_sm_object, ==, 0);
 	}
 	for (unsigned c = 0; c < vd->vdev_children; c++) {
 		refcount += get_obsolete_refcount(vd->vdev_child[c]);
@@ -783,9 +784,9 @@ dump_spacemap(objset_t *os, space_map_t *sm)
 		return;
 
 	(void) printf("space map object %llu:\n",
-	    (longlong_t)sm->sm_phys->smp_object);
-	(void) printf("  smp_objsize = 0x%llx\n",
-	    (longlong_t)sm->sm_phys->smp_objsize);
+	    (longlong_t)sm->sm_object);
+	(void) printf("  smp_length = 0x%llx\n",
+	    (longlong_t)sm->sm_phys->smp_length);
 	(void) printf("  smp_alloc = 0x%llx\n",
 	    (longlong_t)sm->sm_phys->smp_alloc);
 
@@ -1047,7 +1048,8 @@ print_vdev_indirect(vdev_t *vd)
 	}
 	(void) printf("\n");
 
-	uint64_t obsolete_sm_object = vdev_obsolete_sm_object(vd);
+	uint64_t obsolete_sm_object;
+	VERIFY0(vdev_obsolete_sm_object(vd, &obsolete_sm_object));
 	if (obsolete_sm_object != 0) {
 		objset_t *mos = vd->vdev_spa->spa_meta_objset;
 		(void) printf("obsolete space map object %llu:\n",
@@ -3508,9 +3510,11 @@ zdb_load_obsolete_counts(vdev_t *vd)
 	spa_t *spa = vd->vdev_spa;
 	spa_condensing_indirect_phys_t *scip =
 	    &spa->spa_condensing_indirect_phys;
+	uint64_t obsolete_sm_object;
 	uint32_t *counts;
 
-	EQUIV(vdev_obsolete_sm_object(vd) != 0, vd->vdev_obsolete_sm != NULL);
+	VERIFY0(vdev_obsolete_sm_object(vd, &obsolete_sm_object));
+	EQUIV(obsolete_sm_object != 0, vd->vdev_obsolete_sm != NULL);
 	counts = vdev_indirect_mapping_load_obsolete_counts(vim);
 	if (vd->vdev_obsolete_sm != NULL) {
 		vdev_indirect_mapping_load_obsolete_spacemap(vim, counts,
@@ -3521,7 +3525,6 @@ zdb_load_obsolete_counts(vdev_t *vd)
 		space_map_t *prev_obsolete_sm = NULL;
 		VERIFY0(space_map_open(&prev_obsolete_sm, spa->spa_meta_objset,
 		    scip->scip_prev_obsolete_sm_object, 0, vd->vdev_asize, 0));
-		space_map_update(prev_obsolete_sm);
 		vdev_indirect_mapping_load_obsolete_spacemap(vim, counts,
 		    prev_obsolete_sm);
 		space_map_close(prev_obsolete_sm);
@@ -3615,9 +3618,9 @@ zdb_leak_init_vdev_exclude_checkpoint(vdev_t *vd, zdb_cb_t *zcb)
 
 	VERIFY0(space_map_open(&checkpoint_sm, spa_meta_objset(spa),
 	    checkpoint_sm_obj, 0, vd->vdev_asize, vd->vdev_ashift));
-	space_map_update(checkpoint_sm);
 
 	VERIFY0(space_map_iterate(checkpoint_sm,
+	    space_map_length(checkpoint_sm),
 	    checkpoint_sm_exclude_entry_cb, &cseea));
 	space_map_close(checkpoint_sm);
 
@@ -4408,7 +4411,6 @@ verify_device_removal_feature_counts(spa_t *spa)
 			    spa->spa_meta_objset,
 			    scip->scip_prev_obsolete_sm_object,
 			    0, vd->vdev_asize, 0));
-			space_map_update(prev_obsolete_sm);
 			dump_spacemap(spa->spa_meta_objset, prev_obsolete_sm);
 			(void) printf("\n");
 			space_map_close(prev_obsolete_sm);
@@ -4434,7 +4436,9 @@ verify_device_removal_feature_counts(spa_t *spa)
 			ASSERT(vic->vic_mapping_object != 0);
 			precise_vdev_count++;
 		}
-		if (vdev_obsolete_sm_object(vd) != 0) {
+		uint64_t obsolete_sm_object;
+		VERIFY0(vdev_obsolete_sm_object(vd, &obsolete_sm_object));
+		if (obsolete_sm_object != 0) {
 			ASSERT(vic->vic_mapping_object != 0);
 			obsolete_sm_count++;
 		}
@@ -4659,7 +4663,6 @@ verify_checkpoint_vdev_spacemaps(spa_t *checkpoint, spa_t *current)
 		VERIFY0(space_map_open(&checkpoint_sm, spa_meta_objset(current),
 		    checkpoint_sm_obj, 0, current_vd->vdev_asize,
 		    current_vd->vdev_ashift));
-		space_map_update(checkpoint_sm);
 
 		verify_checkpoint_sm_entry_cb_arg_t vcsec;
 		vcsec.vcsec_vd = ckpoint_vd;
@@ -4667,6 +4670,7 @@ verify_checkpoint_vdev_spacemaps(spa_t *checkpoint, spa_t *current)
 		vcsec.vcsec_num_entries =
 		    space_map_length(checkpoint_sm) / sizeof (uint64_t);
 		VERIFY0(space_map_iterate(checkpoint_sm,
+		    space_map_length(checkpoint_sm),
 		    verify_checkpoint_sm_entry_cb, &vcsec));
 		dump_spacemap(current->spa_meta_objset, checkpoint_sm);
 		space_map_close(checkpoint_sm);
@@ -4823,7 +4827,6 @@ dump_leftover_checkpoint_blocks(spa_t *spa)
 
 		VERIFY0(space_map_open(&checkpoint_sm, spa_meta_objset(spa),
 		    checkpoint_sm_obj, 0, vd->vdev_asize, vd->vdev_ashift));
-		space_map_update(checkpoint_sm);
 		dump_spacemap(spa->spa_meta_objset, checkpoint_sm);
 		space_map_close(checkpoint_sm);
 	}

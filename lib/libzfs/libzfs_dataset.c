@@ -29,7 +29,9 @@
  * Copyright (c) 2013 Steven Hartland. All rights reserved.
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright 2016 Igor Kozhukhov <ikozhukhov@gmail.com>
- * Copyright 2017 RackTop Systems.
+ * Copyright 2017-2018 RackTop Systems.
+ * Copyright (c) 2019 Datto Inc.
+ * Copyright (c) 2019, loli10K <ezomori.nozomu@gmail.com>
  */
 
 #include <ctype.h>
@@ -1135,7 +1137,7 @@ zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
 			goto error;
 		}
 
-		if (!zfs_prop_valid_for_type(prop, type)) {
+		if (!zfs_prop_valid_for_type(prop, type, B_FALSE)) {
 			zfs_error_aux(hdl,
 			    dgettext(TEXT_DOMAIN, "'%s' does not "
 			    "apply to datasets of this type"), propname);
@@ -2083,7 +2085,7 @@ zfs_prop_inherit(zfs_handle_t *zhp, const char *propname, boolean_t received)
 	/*
 	 * Check to see if the value applies to this type
 	 */
-	if (!zfs_prop_valid_for_type(prop, zhp->zfs_type))
+	if (!zfs_prop_valid_for_type(prop, zhp->zfs_type, B_FALSE))
 		return (zfs_error(hdl, EZFS_PROPTYPE, errbuf));
 
 	/*
@@ -2233,6 +2235,16 @@ get_numeric_property(zfs_handle_t *zhp, zfs_prop_t prop, zprop_source_t *src,
 	boolean_t received = zfs_is_recvd_props_mode(zhp);
 
 	*source = NULL;
+
+	/*
+	 * If the property is being fetched for a snapshot, check whether
+	 * the property is valid for the snapshot's head dataset type.
+	 */
+	if (zhp->zfs_type == ZFS_TYPE_SNAPSHOT &&
+	    !zfs_prop_valid_for_type(prop, zhp->zfs_head_type, B_TRUE)) {
+		*val = zfs_prop_default_numeric(prop);
+		return (-1);
+	}
 
 	switch (prop) {
 	case ZFS_PROP_ATIME:
@@ -2696,7 +2708,7 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 	/*
 	 * Check to see if this property applies to our object
 	 */
-	if (!zfs_prop_valid_for_type(prop, zhp->zfs_type))
+	if (!zfs_prop_valid_for_type(prop, zhp->zfs_type, B_FALSE))
 		return (-1);
 
 	if (received && zfs_prop_readonly(prop))
@@ -3027,8 +3039,11 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 		break;
 
 	case ZFS_PROP_GUID:
+	case ZFS_PROP_CREATETXG:
+	case ZFS_PROP_OBJSETID:
 		/*
-		 * GUIDs are stored as numbers, but they are identifiers.
+		 * These properties are stored as numbers, but they are
+		 * identifiers.
 		 * We don't want them to be pretty printed, because pretty
 		 * printing mangles the ID into a truncated and useless value.
 		 */
@@ -3140,7 +3155,7 @@ zfs_prop_get_numeric(zfs_handle_t *zhp, zfs_prop_t prop, uint64_t *value,
 	/*
 	 * Check to see if this property applies to our object
 	 */
-	if (!zfs_prop_valid_for_type(prop, zhp->zfs_type)) {
+	if (!zfs_prop_valid_for_type(prop, zhp->zfs_type, B_FALSE)) {
 		return (zfs_error_fmt(zhp->zfs_hdl, EZFS_PROPTYPE,
 		    dgettext(TEXT_DOMAIN, "cannot get property '%s'"),
 		    zfs_prop_to_name(prop)));
@@ -3832,8 +3847,8 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 	}
 
 	(void) parent_name(path, parent, sizeof (parent));
-	if (zfs_crypto_create(hdl, parent, props, NULL, &wkeydata,
-	    &wkeylen) != 0) {
+	if (zfs_crypto_create(hdl, parent, props, NULL, B_TRUE,
+	    &wkeydata, &wkeylen) != 0) {
 		nvlist_free(props);
 		return (zfs_error(hdl, EZFS_CRYPTOFAILED, errbuf));
 	}
@@ -4416,6 +4431,7 @@ zfs_rollback(zfs_handle_t *zhp, zfs_handle_t *snap, boolean_t force)
 	boolean_t restore_resv = 0;
 	uint64_t old_volsize = 0, new_volsize;
 	zfs_prop_t resv_prop = { 0 };
+	uint64_t min_txg = 0;
 
 	assert(zhp->zfs_type == ZFS_TYPE_FILESYSTEM ||
 	    zhp->zfs_type == ZFS_TYPE_VOLUME);
@@ -4426,7 +4442,12 @@ zfs_rollback(zfs_handle_t *zhp, zfs_handle_t *snap, boolean_t force)
 	cb.cb_force = force;
 	cb.cb_target = snap->zfs_name;
 	cb.cb_create = zfs_prop_get_int(snap, ZFS_PROP_CREATETXG);
-	(void) zfs_iter_snapshots(zhp, B_FALSE, rollback_destroy, &cb);
+
+	if (cb.cb_create > 0)
+		min_txg = cb.cb_create;
+
+	(void) zfs_iter_snapshots(zhp, B_FALSE, rollback_destroy, &cb,
+		min_txg, 0);
 	(void) zfs_iter_bookmarks(zhp, rollback_destroy, &cb);
 
 	if (cb.cb_error)
@@ -4509,8 +4530,6 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 	zfs_cmd_t zc = {"\0"};
 	char *delim;
 	prop_changelist_t *cl = NULL;
-	zfs_handle_t *zhrp = NULL;
-	char *parentname = NULL;
 	char parent[ZFS_MAX_DATASET_NAME_LEN];
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
 	char errbuf[1024];
@@ -4605,8 +4624,8 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 	}
 
 	if (recursive) {
-
-		parentname = zfs_strdup(zhp->zfs_hdl, zhp->zfs_name);
+		zfs_handle_t *zhrp;
+		char *parentname = zfs_strdup(zhp->zfs_hdl, zhp->zfs_name);
 		if (parentname == NULL) {
 			ret = -1;
 			goto error;
@@ -4614,13 +4633,15 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 		delim = strchr(parentname, '@');
 		*delim = '\0';
 		zhrp = zfs_open(zhp->zfs_hdl, parentname, ZFS_TYPE_DATASET);
+		free(parentname);
 		if (zhrp == NULL) {
 			ret = -1;
 			goto error;
 		}
-
-	} else {
-		if ((cl = changelist_gather(zhp, ZFS_PROP_NAME, 0,
+		zfs_close(zhrp);
+	} else if (zhp->zfs_type != ZFS_TYPE_SNAPSHOT) {
+		if ((cl = changelist_gather(zhp, ZFS_PROP_NAME,
+		    0,
 		    force_unmount ? MS_FORCE : 0)) == NULL)
 			return (-1);
 
@@ -4690,16 +4711,19 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 	}
 
 error:
-	if (parentname) {
-		free(parentname);
-	}
-	if (zhrp) {
-		zfs_close(zhrp);
-	}
-	if (cl) {
+	if (cl != NULL) {
 		changelist_free(cl);
 	}
 	return (ret);
+}
+
+nvlist_t *
+zfs_get_recvd_props(zfs_handle_t *zhp)
+{
+	if (zhp->zfs_recvd_props == NULL)
+		if (get_recvd_props_ioctl(zhp) != 0)
+			return (NULL);
+	return (zhp->zfs_recvd_props);
 }
 
 nvlist_t *

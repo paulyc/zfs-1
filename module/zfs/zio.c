@@ -34,6 +34,7 @@
 #include <sys/txg.h>
 #include <sys/spa_impl.h>
 #include <sys/vdev_impl.h>
+#include <sys/vdev_trim.h>
 #include <sys/zio_impl.h>
 #include <sys/zio_compress.h>
 #include <sys/zio_checksum.h>
@@ -56,7 +57,7 @@
  * ==========================================================================
  */
 const char *zio_type_name[ZIO_TYPES] = {
-	"z_null", "z_rd", "z_wr", "z_fr", "z_cl", "z_ioctl"
+	"z_null", "z_rd", "z_wr", "z_fr", "z_cl", "z_ioctl", "z_trim"
 };
 
 boolean_t zio_dva_throttle_enabled = B_TRUE;
@@ -769,7 +770,7 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 {
 	zio_t *zio;
 
-	ASSERT3U(psize, <=, SPA_MAXBLOCKSIZE);
+	IMPLY(type != ZIO_TYPE_TRIM, psize <= SPA_MAXBLOCKSIZE);
 	ASSERT(P2PHASE(psize, SPA_MINBLOCKSIZE) == 0);
 	ASSERT(P2PHASE(offset, SPA_MINBLOCKSIZE) == 0);
 
@@ -1217,6 +1218,26 @@ zio_ioctl(zio_t *pio, spa_t *spa, vdev_t *vd, int cmd,
 			zio_nowait(zio_ioctl(zio, spa, vd->vdev_child[c], cmd,
 			    done, private, flags));
 	}
+
+	return (zio);
+}
+
+zio_t *
+zio_trim(zio_t *pio, vdev_t *vd, uint64_t offset, uint64_t size,
+    zio_done_func_t *done, void *private, zio_priority_t priority,
+    enum zio_flag flags, enum trim_flag trim_flags)
+{
+	zio_t *zio;
+
+	ASSERT0(vd->vdev_children);
+	ASSERT0(P2PHASE(offset, 1ULL << vd->vdev_ashift));
+	ASSERT0(P2PHASE(size, 1ULL << vd->vdev_ashift));
+	ASSERT3U(size, !=, 0);
+
+	zio = zio_create(pio, vd->vdev_spa, 0, NULL, NULL, size, size, done,
+	    private, ZIO_TYPE_TRIM, priority, flags | ZIO_FLAG_PHYSICAL,
+	    vd, offset, NULL, ZIO_STAGE_OPEN, ZIO_TRIM_PIPELINE);
+	zio->io_trim_flags = trim_flags;
 
 	return (zio);
 }
@@ -2545,7 +2566,7 @@ zio_write_gang_block(zio_t *pio)
 		ASSERT(!(pio->io_flags & ZIO_FLAG_NODATA));
 
 		flags |= METASLAB_ASYNC_ALLOC;
-		VERIFY(refcount_held(&mc->mc_alloc_slots[pio->io_allocator],
+		VERIFY(zfs_refcount_held(&mc->mc_alloc_slots[pio->io_allocator],
 		    pio));
 
 		/*
@@ -2841,9 +2862,8 @@ zio_ddt_collision(zio_t *zio, ddt_t *ddt, ddt_entry_t *dde)
 {
 	spa_t *spa = zio->io_spa;
 	int p;
-	boolean_t do_raw = (zio->io_flags & ZIO_FLAG_RAW);
+	boolean_t do_raw = !!(zio->io_flags & ZIO_FLAG_RAW);
 
-	/* We should never get a raw, override zio */
 	ASSERT(!(zio->io_bp_override && do_raw));
 
 	/*
@@ -2851,11 +2871,20 @@ zio_ddt_collision(zio_t *zio, ddt_t *ddt, ddt_entry_t *dde)
 	 * because when zio->io_bp is an override bp, we will not have
 	 * pushed the I/O transforms.  That's an important optimization
 	 * because otherwise we'd compress/encrypt all dmu_sync() data twice.
+	 * However, we should never get a raw, override zio so in these
+	 * cases we can compare the io_data directly. This is useful because
+	 * it allows us to do dedup verification even if we don't have access
+	 * to the original data (for instance, if the encryption keys aren't
+	 * loaded).
 	 */
+
 	for (p = DDT_PHYS_SINGLE; p <= DDT_PHYS_TRIPLE; p++) {
 		zio_t *lio = dde->dde_lead_zio[p];
 
-		if (lio != NULL) {
+		if (lio != NULL && do_raw) {
+			return (lio->io_size != zio->io_size ||
+			    abd_cmp(zio->io_abd, lio->io_abd, zio->io_abd->abd_size) != 0);
+		} else if (lio != NULL) {
 			return (lio->io_orig_size != zio->io_orig_size ||
 			    abd_cmp(zio->io_orig_abd, lio->io_orig_abd,
 			    zio->io_orig_size) != 0);
@@ -2865,7 +2894,36 @@ zio_ddt_collision(zio_t *zio, ddt_t *ddt, ddt_entry_t *dde)
 	for (p = DDT_PHYS_SINGLE; p <= DDT_PHYS_TRIPLE; p++) {
 		ddt_phys_t *ddp = &dde->dde_phys[p];
 
-		if (ddp->ddp_phys_birth != 0) {
+		if (ddp->ddp_phys_birth != 0 && do_raw) {
+			blkptr_t blk = *zio->io_bp;
+			uint64_t psize;
+			abd_t *tmpabd;
+			int error;
+
+			ddt_bp_fill(ddp, &blk, ddp->ddp_phys_birth);
+			psize = BP_GET_PSIZE(&blk);
+
+			if (psize != zio->io_size)
+				return (B_TRUE);
+
+			ddt_exit(ddt);
+
+			tmpabd = abd_alloc_for_io(psize, B_TRUE);
+
+			error = zio_wait(zio_read(NULL, spa, &blk, tmpabd,
+			    psize, NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+			    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE |
+			    ZIO_FLAG_RAW, &zio->io_bookmark));
+
+			if (error == 0) {
+				if (abd_cmp(tmpabd, zio->io_abd, tmpabd->abd_size) != 0)
+					error = SET_ERROR(ENOENT);
+			}
+
+			abd_free(tmpabd);
+			ddt_enter(ddt);
+			return (error != 0);
+		} else if (ddp->ddp_phys_birth != 0) {
 			arc_buf_t *abuf = NULL;
 			arc_flags_t aflags = ARC_FLAG_WAIT;
 			int zio_flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE;
@@ -2874,34 +2932,19 @@ zio_ddt_collision(zio_t *zio, ddt_t *ddt, ddt_entry_t *dde)
 
 			ddt_bp_fill(ddp, &blk, ddp->ddp_phys_birth);
 
-			ddt_exit(ddt);
+			if (BP_GET_LSIZE(&blk) != zio->io_orig_size)
+				return (B_TRUE);
 
-			/*
-			 * Intuitively, it would make more sense to compare
-			 * io_abd than io_orig_abd in the raw case since you
-			 * don't want to look at any transformations that have
-			 * happened to the data. However, for raw I/Os the
-			 * data will actually be the same in io_abd and
-			 * io_orig_abd, so all we have to do is issue this as
-			 * a raw ARC read.
-			 */
-			if (do_raw) {
-				zio_flags |= ZIO_FLAG_RAW;
-				ASSERT3U(zio->io_size, ==, zio->io_orig_size);
-				ASSERT0(abd_cmp(zio->io_abd, zio->io_orig_abd,
-				    zio->io_size));
-				ASSERT3P(zio->io_transform_stack, ==, NULL);
-			}
+			ddt_exit(ddt);
 
 			error = arc_read(NULL, spa, &blk,
 			    arc_getbuf_func, &abuf, ZIO_PRIORITY_SYNC_READ,
 			    zio_flags, &aflags, &zio->io_bookmark);
 
 			if (error == 0) {
-				if (arc_buf_size(abuf) != zio->io_orig_size ||
-				    abd_cmp_buf(zio->io_orig_abd, abuf->b_data,
+				if (abd_cmp_buf(zio->io_orig_abd, abuf->b_data,
 				    zio->io_orig_size) != 0)
-					error = SET_ERROR(EEXIST);
+					error = SET_ERROR(ENOENT);
 				arc_buf_destroy(abuf, &abuf);
 			}
 
@@ -3461,7 +3504,6 @@ zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
  * ==========================================================================
  */
 
-
 /*
  * Issue an I/O to the underlying vdev. Typically the issue pipeline
  * stops after this stage and will resume upon I/O completion.
@@ -3586,8 +3628,8 @@ zio_vdev_io_start(zio_t *zio)
 		return (ZIO_PIPELINE_CONTINUE);
 	}
 
-	if (vd->vdev_ops->vdev_op_leaf &&
-	    (zio->io_type == ZIO_TYPE_READ || zio->io_type == ZIO_TYPE_WRITE)) {
+	if (vd->vdev_ops->vdev_op_leaf && (zio->io_type == ZIO_TYPE_READ ||
+	    zio->io_type == ZIO_TYPE_WRITE || zio->io_type == ZIO_TYPE_TRIM)) {
 
 		if (zio->io_type == ZIO_TYPE_READ && vdev_cache_read(zio))
 			return (ZIO_PIPELINE_CONTINUE);
@@ -3618,7 +3660,8 @@ zio_vdev_io_done(zio_t *zio)
 		return (ZIO_PIPELINE_STOP);
 	}
 
-	ASSERT(zio->io_type == ZIO_TYPE_READ || zio->io_type == ZIO_TYPE_WRITE);
+	ASSERT(zio->io_type == ZIO_TYPE_READ ||
+	    zio->io_type == ZIO_TYPE_WRITE || zio->io_type == ZIO_TYPE_TRIM);
 
 	if (zio->io_delay)
 		zio->io_delay = gethrtime() - zio->io_delay;
@@ -3637,7 +3680,7 @@ zio_vdev_io_done(zio_t *zio)
 		if (zio_injection_enabled && zio->io_error == 0)
 			zio->io_error = zio_handle_label_injection(zio, EIO);
 
-		if (zio->io_error) {
+		if (zio->io_error && zio->io_type != ZIO_TYPE_TRIM) {
 			if (!vdev_accessible(vd, zio)) {
 				zio->io_error = SET_ERROR(ENXIO);
 			} else {
@@ -3767,8 +3810,8 @@ zio_vdev_io_assess(zio_t *zio)
 
 	/*
 	 * If a cache flush returns ENOTSUP or ENOTTY, we know that no future
-	 * attempts will ever succeed. In this case we set a persistent bit so
-	 * that we don't bother with it in the future.
+	 * attempts will ever succeed. In this case we set a persistent
+	 * boolean flag so that we don't bother with it in the future.
 	 */
 	if ((zio->io_error == ENOTSUP || zio->io_error == ENOTTY) &&
 	    zio->io_type == ZIO_TYPE_IOCTL &&
@@ -4260,7 +4303,7 @@ zio_done(zio_t *zio)
 
 		metaslab_group_alloc_verify(zio->io_spa, zio->io_bp, zio,
 		    zio->io_allocator);
-		VERIFY(refcount_not_held(
+		VERIFY(zfs_refcount_not_held(
 		    &zio->io_metaslab_class->mc_alloc_slots[zio->io_allocator],
 		    zio));
 	}

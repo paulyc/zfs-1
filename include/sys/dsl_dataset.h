@@ -117,6 +117,12 @@ struct dsl_key_mapping;
 #define	DS_FIELD_REMAP_DEADLIST	"com.delphix:remap_deadlist"
 
 /*
+ * This field is set to the ivset guid for encrypted snapshots. This is used
+ * for validating raw receives.
+ */
+#define	DS_FIELD_IVSET_GUID	"com.datto:ivset_guid"
+
+/*
  * DS_FLAG_CI_DATASET is set if the dataset contains a file system whose
  * name lookups should be performed case-insensitively.
  */
@@ -215,7 +221,7 @@ typedef struct dsl_dataset {
 	 * Owning counts as a long hold.  See the comments above
 	 * dsl_pool_hold() for details.
 	 */
-	refcount_t ds_longholds;
+	zfs_refcount_t ds_longholds;
 
 	/* no locking; only for making guesses */
 	uint64_t ds_trysnap_txg;

@@ -416,6 +416,15 @@ get_special_prop(lua_State *state, dsl_dataset_t *ds, const char *dsname,
 	case ZFS_PROP_INCONSISTENT:
 		numval = dsl_get_inconsistent(ds);
 		break;
+	case ZFS_PROP_IVSET_GUID:
+		if (dsl_dataset_is_zapified(ds)) {
+			error = zap_lookup(ds->ds_dir->dd_pool->dp_meta_objset,
+			    ds->ds_object, DS_FIELD_IVSET_GUID,
+			    sizeof (numval), 1, &numval);
+		} else {
+			error = ENOENT;
+		}
+		break;
 	case ZFS_PROP_RECEIVE_RESUME_TOKEN: {
 		char *token = get_receive_resume_stats_impl(ds);
 
@@ -587,7 +596,7 @@ prop_valid_for_ds(dsl_dataset_t *ds, zfs_prop_t zfs_prop)
 	error = get_objset_type(ds, &zfs_type);
 	if (error != 0)
 		return (B_FALSE);
-	return (zfs_prop_valid_for_type(zfs_prop, zfs_type));
+	return (zfs_prop_valid_for_type(zfs_prop, zfs_type, B_FALSE));
 }
 
 /*

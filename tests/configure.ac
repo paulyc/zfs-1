@@ -33,9 +33,10 @@ AM_MAINTAINER_MODE
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 AM_INIT_AUTOMAKE
 
-AC_PROG_CC
+AC_PROG_CC(clang)
 AC_PROG_INSTALL
 AM_PROG_AS
+AC_PROG_LIBTOOL
 
 PREFIX=`/bin/pwd`
 AC_SUBST(PREFIX)
@@ -56,17 +57,24 @@ AC_CONFIG_FILES([
 	zfs-tests/cmd/readmmap/Makefile
 	zfs-tests/cmd/file_write/Makefile
 	zfs-tests/cmd/randfree_file/Makefile
+	zfs-tests/cmd/mkfile/Makefile
+	zfs-tests/cmd/mkfiles/Makefile
 	zfs-tests/cmd/mktree/Makefile
 	zfs-tests/cmd/file_check/Makefile
 	zfs-tests/cmd/rm_lnkcnt_zero_file/Makefile
 	zfs-tests/cmd/chg_usr_exec/Makefile
 	zfs-tests/cmd/mmapwrite/Makefile
+	zfs-tests/cmd/nvlist_to_lua/Makefile
 	zfs-tests/cmd/xattrtest/Makefile
+	zfs-tests/cmd/libzfs_input_check/Makefile
 	zfs-tests/tests/functional/exec/Makefile
 	zfs-tests/tests/functional/ctime/Makefile
 	zfs-tests/include/commands.cfg
 	zfs-tests/runfiles/osx.run
 	zfs-tests/include/default.cfg
+	zfs-tests/tests/functional/libzfs/Makefile
+	zfs-tests/tests/functional/tmpfile/Makefile
+	zfs-tests/tests/functional/checksum/Makefile
 ])
 
 AC_OUTPUT

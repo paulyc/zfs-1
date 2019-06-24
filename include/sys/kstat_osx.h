@@ -31,7 +31,7 @@ typedef struct osx_kstat {
 
 	kstat_named_t darwin_active_vnodes;
 	kstat_named_t darwin_debug;
-        kstat_named_t darwin_reclaim_nodes;
+	kstat_named_t darwin_reclaim_nodes;
 	kstat_named_t darwin_ignore_negatives;
 	kstat_named_t darwin_ignore_positives;
 	kstat_named_t darwin_create_negatives;
@@ -137,6 +137,20 @@ typedef struct osx_kstat {
 
 	kstat_named_t zfs_lua_max_instrlimit;
 	kstat_named_t zfs_lua_max_memlimit;
+
+	kstat_named_t zfs_trim_extent_bytes_max;
+	kstat_named_t zfs_trim_extent_bytes_min;
+	kstat_named_t zfs_trim_metaslab_skip;
+	kstat_named_t zfs_trim_txg_batch;
+	kstat_named_t zfs_trim_queue_limit;
+
+	kstat_named_t zfs_send_unmodified_spill_blocks;
+	kstat_named_t zfs_special_class_metadata_reserve_pct;
+
+	kstat_named_t zfs_vdev_raidz_impl;
+	kstat_named_t icp_gcm_impl;
+	kstat_named_t icp_aes_impl;
+	kstat_named_t zfs_fletcher_4_impl;
 } osx_kstat_t;
 
 
@@ -233,6 +247,16 @@ extern uint64_t zfs_vdev_file_size_mismatch_cnt;
 
 extern uint64_t zfs_lua_max_instrlimit;
 extern uint64_t zfs_lua_max_memlimit;
+
+
+extern uint64_t  zfs_trim_extent_bytes_max;
+extern uint64_t  zfs_trim_extent_bytes_min;
+extern uint64_t  zfs_trim_metaslab_skip;
+extern uint64_t  zfs_trim_txg_batch;
+extern uint64_t  zfs_trim_queue_limit;
+
+extern uint64_t  zfs_send_unmodified_spill_blocks;
+extern uint64_t  zfs_special_class_metadata_reserve_pct;
 
 int        kstat_osx_init(void);
 void       kstat_osx_fini(void);

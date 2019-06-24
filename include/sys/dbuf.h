@@ -230,7 +230,7 @@ typedef struct dmu_buf_impl {
 	 * If nonzero, the buffer can't be destroyed.
 	 * Protected by db_mtx.
 	 */
-	refcount_t db_holds;
+	zfs_refcount_t db_holds;
 
 	/* buffer holding our data */
 	arc_buf_t *db_buf;
@@ -313,7 +313,7 @@ boolean_t dbuf_try_add_ref(dmu_buf_t *db, objset_t *os, uint64_t obj,
 uint64_t dbuf_refcount(dmu_buf_impl_t *db);
 
 void dbuf_rele(dmu_buf_impl_t *db, void *tag);
-void dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag);
+void dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag, boolean_t evicting);
 
 dmu_buf_impl_t *dbuf_find(struct objset *os, uint64_t object, uint8_t level,
     uint64_t blkid);

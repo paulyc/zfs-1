@@ -283,6 +283,9 @@ vdev_config_generate_stats(vdev_t *vd, nvlist_t *nv)
 	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SCRUB_ACTIVE_QUEUE,
 	    vsx->vsx_active_queue[ZIO_PRIORITY_SCRUB]);
 
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_TRIM_ACTIVE_QUEUE,
+	    vsx->vsx_active_queue[ZIO_PRIORITY_TRIM]);
+
 	/* ZIOs pending */
 	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SYNC_R_PEND_QUEUE,
 	    vsx->vsx_pend_queue[ZIO_PRIORITY_SYNC_READ]);
@@ -298,6 +301,9 @@ vdev_config_generate_stats(vdev_t *vd, nvlist_t *nv)
 
 	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SCRUB_PEND_QUEUE,
 	    vsx->vsx_pend_queue[ZIO_PRIORITY_SCRUB]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_TRIM_PEND_QUEUE,
+	    vsx->vsx_pend_queue[ZIO_PRIORITY_TRIM]);
 
 	/* Histograms */
 	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_TOT_R_LAT_HISTO,
@@ -336,6 +342,10 @@ vdev_config_generate_stats(vdev_t *vd, nvlist_t *nv)
 	    vsx->vsx_queue_histo[ZIO_PRIORITY_SCRUB],
 	    ARRAY_SIZE(vsx->vsx_queue_histo[ZIO_PRIORITY_SCRUB]));
 
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_TRIM_LAT_HISTO,
+	    vsx->vsx_queue_histo[ZIO_PRIORITY_TRIM],
+	    ARRAY_SIZE(vsx->vsx_queue_histo[ZIO_PRIORITY_TRIM]));
+
 	/* Request sizes */
 	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SYNC_IND_R_HISTO,
 	    vsx->vsx_ind_histo[ZIO_PRIORITY_SYNC_READ],
@@ -357,6 +367,10 @@ vdev_config_generate_stats(vdev_t *vd, nvlist_t *nv)
 	    vsx->vsx_ind_histo[ZIO_PRIORITY_SCRUB],
 	    ARRAY_SIZE(vsx->vsx_ind_histo[ZIO_PRIORITY_SCRUB]));
 
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_IND_TRIM_HISTO,
+	    vsx->vsx_ind_histo[ZIO_PRIORITY_TRIM],
+	    ARRAY_SIZE(vsx->vsx_ind_histo[ZIO_PRIORITY_TRIM]));
+
 	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SYNC_AGG_R_HISTO,
 	    vsx->vsx_agg_histo[ZIO_PRIORITY_SYNC_READ],
 	    ARRAY_SIZE(vsx->vsx_agg_histo[ZIO_PRIORITY_SYNC_READ]));
@@ -376,6 +390,10 @@ vdev_config_generate_stats(vdev_t *vd, nvlist_t *nv)
 	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_AGG_SCRUB_HISTO,
 	    vsx->vsx_agg_histo[ZIO_PRIORITY_SCRUB],
 	    ARRAY_SIZE(vsx->vsx_agg_histo[ZIO_PRIORITY_SCRUB]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_AGG_TRIM_HISTO,
+	    vsx->vsx_agg_histo[ZIO_PRIORITY_TRIM],
+	    ARRAY_SIZE(vsx->vsx_agg_histo[ZIO_PRIORITY_TRIM]));
 
 	/* Add extended stats nvlist to main nvlist */
 	fnvlist_add_nvlist(nv, ZPOOL_CONFIG_VDEV_STATS_EX, nvx);
@@ -519,6 +537,12 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 			fnvlist_add_uint64(nv, ZPOOL_CONFIG_VDEV_TOP_ZAP,
 			    vd->vdev_top_zap);
 		}
+
+		if (vd->vdev_resilver_deferred) {
+			ASSERT(vd->vdev_ops->vdev_op_leaf);
+			ASSERT(spa->spa_resilver_deferred);
+			fnvlist_add_boolean(nv, ZPOOL_CONFIG_RESILVER_DEFER);
+		}
 	}
 
 	if (getstats) {
@@ -641,6 +665,7 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 		if (vd->vdev_ishole)
 			fnvlist_add_uint64(nv, ZPOOL_CONFIG_IS_HOLE, B_TRUE);
 
+		/* Set the reason why we're FAULTED/DEGRADED. */
 		switch (vd->vdev_stat.vs_aux) {
 		case VDEV_AUX_ERR_EXCEEDED:
 			aux = "err_exceeded";
@@ -651,8 +676,15 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 			break;
 		}
 
-		if (aux != NULL)
+		if (aux != NULL && !vd->vdev_tmpoffline) {
 			fnvlist_add_string(nv, ZPOOL_CONFIG_AUX_STATE, aux);
+		} else {
+			/*
+			 * We're healthy - clear any previous AUX_STATE values.
+			 */
+			if (nvlist_exists(nv, ZPOOL_CONFIG_AUX_STATE))
+				nvlist_remove_all(nv, ZPOOL_CONFIG_AUX_STATE);
+		}
 
 		if (vd->vdev_splitting && vd->vdev_orig_guid != 0LL) {
 			fnvlist_add_uint64(nv, ZPOOL_CONFIG_ORIG_GUID,

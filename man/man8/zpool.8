@@ -24,16 +24,18 @@
 .\" Copyright 2017 Nexenta Systems, Inc.
 .\" Copyright (c) 2017 Datto Inc.
 .\" Copyright (c) 2017 George Melikov. All Rights Reserved.
+.\" Copyright 2017 Nexenta Systems, Inc.
+.\" Copyright (c) 2017 Open-E, Inc. All Rights Reserved.
 .\"
-.Dd April 27, 2018
-.Dt ZPOOL 1M
-.Os
+.Dd May 2, 2019
+.Dt ZPOOL 8 SMM
+.Os Linux
 .Sh NAME
 .Nm zpool
 .Nd configure ZFS storage pools
 .Sh SYNOPSIS
 .Nm
-.Fl ?
+.Fl ?V
 .Nm
 .Cm add
 .Op Fl fn
@@ -106,7 +108,7 @@
 .Op Ar newpool
 .Nm
 .Cm initialize
-.Op Fl cs
+.Op Fl c | Fl s
 .Ar pool
 .Op Ar device Ns ...
 .Nm
@@ -139,6 +141,7 @@
 .Ar pool
 .Nm
 .Cm reopen
+.Op Fl n
 .Ar pool
 .Nm
 .Cm remove
@@ -153,9 +156,19 @@
 .Op Fl f
 .Ar pool Ar device Op Ar new_device
 .Nm
+.Cm resilver
+.Ar pool Ns ...
+.Nm
 .Cm scrub
 .Op Fl s | Fl p
 .Ar pool Ns ...
+.Nm
+.Cm trim
+.Op Fl d
+.Op Fl r Ar rate
+.Op Fl c | Fl s
+.Ar pool
+.Op Ar device Ns ...
 .Nm
 .Cm set
 .Ar property Ns = Ns Ar value
@@ -168,7 +181,8 @@
 .Ar pool newpool
 .Nm
 .Cm status
-.Op Fl Dvx
+.Oo Fl c Ar SCRIPT Oc
+.Op Fl DigLpPsvx
 .Op Fl T Sy u Ns | Ns Sy d
 .Oo Ar pool Oc Ns ...
 .Op Ar interval Op Ar count
@@ -184,6 +198,8 @@
 .Cm upgrade
 .Op Fl V Ar version
 .Fl a Ns | Ns Ar pool Ns ...
+.Nm
+.Cm version
 .Sh DESCRIPTION
 The
 .Nm
@@ -254,7 +270,7 @@ The minimum number of devices in a raidz group is one more than the number of
 parity disks.
 The recommended number is between 3 and 9 to help increase performance.
 .It Sy spare
-A special pseudo-vdev which keeps track of available hot spares for a pool.
+A pseudo-vdev which keeps track of available hot spares for a pool.
 For more information, see the
 .Sx Hot Spares
 section.
@@ -268,16 +284,16 @@ For more information, see the
 .Sx Intent Log
 section.
 .It Sy dedup
-A device dedicated solely for allocating dedup data.
+A device dedicated solely for deduplication tables.
 The redundancy of this device should match the redundancy of the other normal
 devices in the pool. If more than one dedup device is specified, then
-allocations are load-balanced between devices.
+allocations are load-balanced between those devices.
 .It Sy special
 A device dedicated solely for allocating various kinds of internal metadata,
-and optionally small file data.
+and optionally small file blocks.
 The redundancy of this device should match the redundancy of the other normal
 devices in the pool. If more than one special device is specified, then
-allocations are load-balanced between devices.
+allocations are load-balanced between those devices.
 .Pp
 For more information on special allocations, see the
 .Sx Special Allocation Class
@@ -526,15 +542,15 @@ current state of the pool won't be scanned during a scrub.
 .Ss Special Allocation Class
 The allocations in the special class are dedicated to specific block types.
 By default this includes all metadata, the indirect blocks of user data, and
-any dedup data.  The class can also be provisioned to accept a limited
-percentage of small file data blocks.
+any deduplication tables.  The class can also be provisioned to accept
+small file blocks.
 .Pp
-A pool must always have at least one general (non-specified) vdev before
+A pool must always have at least one normal (non-dedup/special) vdev before
 other devices can be assigned to the special class. If the special class
 becomes full, then allocations intended for it will spill back into the
 normal class.
 .Pp
-Dedup data can be excluded from the special class by setting the
+Deduplication tables can be excluded from the special class by setting the
 .Sy zfs_ddt_data_is_special
 zfs module parameter to false (0).
 .Pp
@@ -542,7 +558,7 @@ Inclusion of small file blocks in the special class is opt-in. Each dataset
 can control the size of small file blocks allowed in the special class by
 setting the
 .Sy special_small_blocks
-dataset property. It defaults to zero so you must opt-in by setting it to a
+dataset property. It defaults to zero, so you must opt-in by setting it to a
 non-zero value. See
 .Xr zfs 8
 for more info on setting this property.
@@ -652,6 +668,30 @@ changed with the
 .Nm zpool Cm set
 command:
 .Bl -tag -width Ds
+.It Sy ashift Ns = Ns Sy ashift
+Pool sector size exponent, to the power of
+.Sy 2
+(internally referred to as
+.Sy ashift
+). Values from 9 to 16, inclusive, are valid; also, the
+value 0 (the default) means to auto-detect using the kernel's block
+layer and a ZFS internal exception list. I/O operations will be aligned
+to the specified size boundaries. Additionally, the minimum (disk)
+write size will be set to the specified size, so this represents a
+space vs. performance trade-off. For optimal performance, the pool
+sector size should be greater than or equal to the sector size of the
+underlying disks. The typical case for setting this property is when
+performance is important and the underlying disks use 4KiB sectors but
+report 512B sectors to the OS (for compatibility reasons); in that
+case, set
+.Sy ashift=12
+(which is 1<<12 = 4096). When set, this property is
+used as the default hint value in subsequent vdev operations (add,
+attach and replace). Changing this value will not modify any existing
+vdev, not even on disk replacement; however it can be used, for
+instance, to replace a dying 512B sectors disk with a newer 4KiB
+sectors device: this will probably result in bad performance but at the
+same time could prevent loss of data.
 .It Sy autoexpand Ns = Ns Sy on Ns | Ns Sy off
 Controls automatic pool expansion when the underlying LUN is grown.
 If set to
@@ -694,9 +734,9 @@ imported.
 Setting this property caches the pool configuration in a different location that
 can later be imported with
 .Nm zpool Cm import Fl c .
-Setting it to the special value
+Setting it to the value
 .Sy none
-creates a temporary pool that is never cached, and the special value
+creates a temporary pool that is never cached, and the
 .Qq
 .Pq empty string
 uses the default location.
@@ -713,6 +753,9 @@ such that it is available even if the pool becomes faulted.
 An administrator can provide additional information about a pool using this
 property.
 .It Sy dedupditto Ns = Ns Ar number
+This property is deprecated.  In a future release, it will no longer have any
+effect.
+.Pp
 Threshold for the number of block ditto copies.
 If the reference count for a deduplicated block increases above this number, a
 new ditto copy of this block is automatically stored.
@@ -746,6 +789,28 @@ Any write requests that have yet to be committed to disk would be blocked.
 .It Sy panic
 Prints out a message to the console and generates a system crash dump.
 .El
+.It Sy autotrim Ns = Ns Sy on Ns | Ns Sy off
+When set to
+.Sy on
+space which has been recently freed, and is no longer allocated by the pool,
+will be periodically trimmed.  This allows block device vdevs which support
+BLKDISCARD, such as SSDs, or file vdevs on which the underlying file system
+supports hole-punching, to reclaim unused blocks.  The default setting for
+this property is
+.Sy off .
+.Pp
+Automatic TRIM does not immediately reclaim blocks after a free. Instead,
+it will optimistically delay allowing smaller ranges to be aggregated in to
+a few larger ones.  These can then be issued more efficiently to the storage.
+.Pp
+Be aware that automatic trimming of recently freed data blocks can put
+significant stress on the underlying storage devices.  This will vary
+depending of how well the specific device handles these commands.  For
+lower end devices it is often possible to achieve most of the benefits
+of automatic trimming by running an on-demand (manual) TRIM periodically
+using the
+.Nm zpool Cm trim
+command.
 .It Sy feature@ Ns Ar feature_name Ns = Ns Sy enabled
 The value of this property is the current state of
 .Ar feature_name .
@@ -812,6 +877,13 @@ The following subcommands are supported:
 .Fl ?
 .Xc
 Displays a help message.
+.It Xo
+.Nm
+.Fl V, -version
+.Xc
+An alias for the
+.Nm zpool Cm version
+subcommand.
 .It Xo
 .Nm
 .Cm add
@@ -1420,7 +1492,7 @@ to fully rewind.
 .It Xo
 .Nm
 .Cm initialize
-.Op Fl cs
+.Op Fl c | Fl s
 .Ar pool
 .Op Ar device Ns ...
 .Xc
@@ -1478,9 +1550,96 @@ Specify
 for standard date format.
 See
 .Xr date 1 .
+.It Fl g
+Display vdev GUIDs instead of the normal device names. These GUIDs
+can be used in place of device names for the zpool
+detach/offline/remove/replace commands.
+.It Fl H
+Scripted mode. Do not display headers, and separate fields by a
+single tab instead of arbitrary space.
+.It Fl L
+Display real paths for vdevs resolving all symbolic links. This can
+be used to look up the current block device name regardless of the
+.Pa /dev/disk/
+path used to open it.
+.It Fl n
+Print headers only once when passed
+.It Fl p
+Display numbers in parsable (exact) values. Time values are in
+nanoseconds.
+.It Fl P
+Display full paths for vdevs instead of only the last component of
+the path. This can be used in conjunction with the
+.Fl L
+flag.
+.It Fl r
+Print request size histograms for the leaf vdev's IO. This includes
+histograms of individual IOs (ind) and aggregate IOs (agg). These stats
+can be useful for observing how well IO aggregation is working.  Note
+that TRIM IOs may exceed 16M, but will be counted as 16M.
 .It Fl v
 Verbose statistics Reports usage statistics for individual vdevs within the
 pool, in addition to the pool-wide statistics.
+.It Fl y
+Omit statistics since boot.
+Normally the first line of output reports the statistics since boot.
+This option suppresses that first line of output.
+.Ar interval
+.It Fl w
+Display latency histograms:
+.Pp
+.Ar total_wait :
+Total IO time (queuing + disk IO time).
+.Ar disk_wait :
+Disk IO time (time reading/writing the disk).
+.Ar syncq_wait :
+Amount of time IO spent in synchronous priority queues.  Does not include
+disk time.
+.Ar asyncq_wait :
+Amount of time IO spent in asynchronous priority queues.  Does not include
+disk time.
+.Ar scrub :
+Amount of time IO spent in scrub queue. Does not include disk time.
+.It Fl l
+Include average latency statistics:
+.Pp
+.Ar total_wait :
+Average total IO time (queuing + disk IO time).
+.Ar disk_wait :
+Average disk IO time (time reading/writing the disk).
+.Ar syncq_wait :
+Average amount of time IO spent in synchronous priority queues. Does
+not include disk time.
+.Ar asyncq_wait :
+Average amount of time IO spent in asynchronous priority queues.
+Does not include disk time.
+.Ar scrub :
+Average queuing time in scrub queue. Does not include disk time.
+.Ar trim :
+Average queuing time in trim queue. Does not include disk time.
+.It Fl q
+Include active queue statistics. Each priority queue has both
+pending (
+.Ar pend )
+and active (
+.Ar activ )
+IOs. Pending IOs are waiting to
+be issued to the disk, and active IOs have been issued to disk and are
+waiting for completion. These stats are broken out by priority queue:
+.Pp
+.Ar syncq_read/write :
+Current number of entries in synchronous priority
+queues.
+.Ar asyncq_read/write :
+Current number of entries in asynchronous priority queues.
+.Ar scrubq_read :
+Current number of entries in scrub queue.
+.Ar trimq_write :
+Current number of entries in trim queue.
+.Pp
+All queue statistics are instantaneous measurements of the number of
+entries in the queues. If you specify an interval, the measurements
+will be sampled from the end of the interval.
 .El
 .It Xo
 .Nm
@@ -1595,9 +1754,14 @@ performing this action.
 .It Xo
 .Nm
 .Cm reopen
+.Op Fl n
 .Ar pool
 .Xc
 Reopen all the vdevs associated with the pool.
+.Bl -tag -width Ds
+.It Fl n
+Do not restart an in-progress scrub operation. This is not recommended and can
+result in partially resilvered devices unless a second scrub is performed.
 .It Xo
 .Nm
 .Cm remove
@@ -1719,6 +1883,10 @@ If a scrub is paused, the
 resumes it.
 If a resilver is in progress, ZFS does not allow a scrub to be started until the
 resilver completes.
+.Pp
+Note that, due to changes in pool data on a live system, it is possible for
+scrubs to progress slightly beyond 100% completion. During this period, no
+completion time estimate will be provided.
 .Bl -tag -width Ds
 .It Fl s
 Stop scrubbing.
@@ -1735,6 +1903,66 @@ To resume a paused scrub issue
 .Nm zpool Cm scrub
 again.
 .El
+.It Xo
+.Nm
+.Cm resilver
+.Ar pool Ns ...
+.Xc
+Starts a resilver. If an existing resilver is already running it will be
+restarted from the beginning. Any drives that were scheduled for a deferred
+resilver will be added to the new one. This requires the
+.Sy resilver_defer
+feature.
+.It Xo
+.Nm
+.Cm trim
+.Op Fl d
+.Op Fl c | Fl s
+.Ar pool
+.Op Ar device Ns ...
+.Xc
+Initiates an immediate on-demand TRIM operation for all of the free space in
+a pool.  This operation informs the underlying storage devices of all blocks
+in the pool which are no longer allocated and allows thinly provisioned
+devices to reclaim the space.
+.Pp
+A manual on-demand TRIM operation can be initiated irrespective of the
+.Sy autotrim
+pool property setting.  See the documentation for the
+.Sy autotrim
+property above for the types of vdev devices which can be trimmed.
+.Bl -tag -width Ds
+.It Fl d -secure
+Causes a secure TRIM to be initiated.  When performing a secure TRIM, the
+device guarantees that data stored on the trimmed blocks has been erased.
+This requires support from the device and is not supported by all SSDs.
+.It Fl r -rate Ar rate
+Controls the rate at which the TRIM operation progresses.  Without this
+option TRIM is executed as quickly as possible. The rate, expressed in bytes
+per second, is applied on a per-vdev basis and may be set differently for
+each leaf vdev.
+.It Fl c, -cancel
+Cancel trimming on the specified devices, or all eligible devices if none
+are specified.
+If one or more target devices are invalid or are not currently being
+trimmed, the command will fail and no cancellation will occur on any device.
+.It Fl s -suspend
+Suspend trimming on the specified devices, or all eligible devices if none
+are specified.
+If one or more target devices are invalid or are not currently being
+trimmed, the command will fail and no suspension will occur on any device.
+Trimming can then be resumed by running
+.Nm zpool Cm trim
+with no flags on the relevant target devices.
+.El
+.It Xo
+.Nm
+.Cm resilver
+.Ar pool Ns ...
+.Xc
+Starts a resilver. If an existing resilver is already running it will be
+restarted from the beginning. Any drives that were scheduled for a deferred
+resilver will be added to the new one.
 .It Xo
 .Nm
 .Cm set
@@ -1798,7 +2026,8 @@ and automatically import it.
 .It Xo
 .Nm
 .Cm status
-.Op Fl Dvx
+.Op Fl c Op Ar SCRIPT1 Ns Oo , Ns Ar SCRIPT2 Oc Ns ...
+.Op Fl DigLpPsvx
 .Op Fl T Sy u Ns | Ns Sy d
 .Oo Ar pool Oc Ns ...
 .Op Ar interval Op Ar count
@@ -1816,12 +2045,41 @@ and the estimated time to completion.
 Both of these are only approximate, because the amount of data in the pool and
 the other workloads on the system can change.
 .Bl -tag -width Ds
+.It Fl c Op Ar SCRIPT1 Ns Oo , Ns Ar SCRIPT2 Oc Ns ...
+Run a script (or scripts) on each vdev and include the output as a new column
+in the
+.Nm zpool Cm status
+output.  See the
+.Fl c
+option of
+.Nm zpool Cm iostat
+for complete details.
+.It Fl i
+Display vdev initialization status.
+.It Fl g
+Display vdev GUIDs instead of the normal device names. These GUIDs
+can be used in place of device names for the zpool
+detach/offline/remove/replace commands.
+.It Fl L
+Display real paths for vdevs resolving all symbolic links. This can
+be used to look up the current block device name regardless of the
+.Pa /dev/disk/
+path used to open it.
+.It Fl p
+Display numbers in parsable (exact) values.
+.It Fl P
+Display full paths for vdevs instead of only the last component of
+the path. This can be used in conjunction with the
+.Fl L
+flag.
 .It Fl D
 Display a histogram of deduplication statistics, showing the allocated
 .Pq physically present on disk
 and referenced
 .Pq logically referenced in the pool
 block counts and sizes by reference count.
+.It Fl t
+Display vdev TRIM status.
 .It Fl T Sy u Ns | Ns Sy d
 Display a time stamp.
 Specify
@@ -1897,6 +2155,13 @@ flag is specified, no features will be enabled on the pool.
 This option can only be used to increase the version number up to the last
 supported legacy version number.
 .El
+.It Xo
+.Nm
+.Cm version
+.Xc
+Displays the software version of the
+.Nm
+userland utility and the zfs kernel module.
 .El
 .Sh EXIT STATUS
 The following exit values are returned:
@@ -2095,6 +2360,104 @@ data        23.9G  14.6G  9.30G    48%         -    61%  1.00x  ONLINE  -
     c1t2d0      -      -      -      -       10G
     c1t3d0      -      -      -      -         -
 .Ed
+.El
+.Sh ENVIRONMENT VARIABLES
+.Bl -tag -width "ZFS_ABORT"
+.It Ev ZFS_ABORT
+Cause
+.Nm zpool
+to dump core on exit for the purposes of running
+.Sy ::findleaks .
+.El
+.Bl -tag -width "ZPOOL_IMPORT_PATH"
+.It Ev ZPOOL_IMPORT_PATH
+The search path for devices or files to use with the pool. This is a colon-separated list of directories in which
+.Nm zpool
+looks for device nodes and files.
+Similar to the
+.Fl d
+option in
+.Nm zpool import .
+.El
+.Bl -tag -width "ZPOOL_VDEV_NAME_GUID"
+.It Ev ZPOOL_VDEV_NAME_GUID
+Cause
+.Nm zpool
+subcommands to output vdev guids by default.  This behavior is identical to the
+.Nm zpool status -g
+command line option.
+.El
+.Bl -tag -width "ZPOOL_VDEV_NAME_FOLLOW_LINKS"
+.It Ev ZPOOL_VDEV_NAME_FOLLOW_LINKS
+Cause
+.Nm zpool
+subcommands to follow links for vdev names by default.  This behavior is identical to the
+.Nm zpool status -L
+command line option.
+.El
+.Bl -tag -width "ZPOOL_VDEV_NAME_PATH"
+.It Ev ZPOOL_VDEV_NAME_PATH
+Cause
+.Nm zpool
+subcommands to output full vdev path names by default.  This
+behavior is identical to the
+.Nm zpool status -p
+command line option.
+.El
+.Bl -tag -width "ZFS_VDEV_DEVID_OPT_OUT"
+.It Ev ZFS_VDEV_DEVID_OPT_OUT
+Older ZFS on Linux implementations had issues when attempting to display pool
+config VDEV names if a
+.Sy devid
+NVP value is present in the pool's config.
+.Pp
+For example, a pool that originated on illumos platform would have a devid
+value in the config and
+.Nm zpool status
+would fail when listing the config.
+This would also be true for future Linux based pools.
+.Pp
+A pool can be stripped of any
+.Sy devid
+values on import or prevented from adding
+them on
+.Nm zpool create
+or
+.Nm zpool add
+by setting
+.Sy ZFS_VDEV_DEVID_OPT_OUT .
+.El
+.Bl -tag -width "ZPOOL_SCRIPTS_AS_ROOT"
+.It Ev ZPOOL_SCRIPTS_AS_ROOT
+Allow a privileged user to run the
+.Nm zpool status/iostat
+with the
+.Fl c
+option.  Normally, only unprivileged users are allowed to run
+.Fl c .
+.El
+.Bl -tag -width "ZPOOL_SCRIPTS_PATH"
+.It Ev ZPOOL_SCRIPTS_PATH
+The search path for scripts when running
+.Nm zpool status/iostat
+with the
+.Fl c
+option. This is a colon-separated list of directories and overrides the default
+.Pa ~/.zpool.d
+and
+.Pa /etc/zfs/zpool.d
+search paths.
+.El
+.Bl -tag -width "ZPOOL_SCRIPTS_ENABLED"
+.It Ev ZPOOL_SCRIPTS_ENABLED
+Allow a user to run
+.Nm zpool status/iostat
+with the
+.Fl c
+option. If
+.Sy ZPOOL_SCRIPTS_ENABLED
+is not set, it is assumed that the user is allowed to run
+.Nm zpool status/iostat -c .
 .El
 .Sh INTERFACE STABILITY
 .Sy Evolving

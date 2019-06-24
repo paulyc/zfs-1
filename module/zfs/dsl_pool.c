@@ -223,6 +223,14 @@ dsl_pool_open_impl(spa_t *spa, uint64_t txg)
 		minclsyspri, max_ncpus * 8, INT_MAX,
 		TASKQ_PREPOPULATE | TASKQ_DYNAMIC);
 
+	// Used with taskq_dispatch_ent()
+	dp->dp_vnget_taskq = taskq_create("zfs_vn_get_taskq", 1,
+		minclsyspri, 0, 0, 0);
+
+	dp->dp_unlinked_drain_taskq = taskq_create("z_unlinked_drain",
+	    max_ncpus, defclsyspri, max_ncpus, INT_MAX,
+	    TASKQ_PREPOPULATE | TASKQ_DYNAMIC);
+
 	return (dp);
 }
 
@@ -232,12 +240,20 @@ dsl_pool_init(spa_t *spa, uint64_t txg, dsl_pool_t **dpp)
 	int err;
 	dsl_pool_t *dp = dsl_pool_open_impl(spa, txg);
 
+	/*
+	 * Initialize the caller's dsl_pool_t structure before we actually open
+	 * the meta objset.  This is done because a self-healing write zio may
+	 * be issued as part of dmu_objset_open_impl() and the spa needs its
+	 * dsl_pool_t initialized in order to handle the write.
+	 */
+	*dpp = dp;
+
 	err = dmu_objset_open_impl(spa, NULL, &dp->dp_meta_rootbp,
 	    &dp->dp_meta_objset);
-	if (err != 0)
+	if (err != 0) {
 		dsl_pool_close(dp);
-	else
-		*dpp = dp;
+		*dpp = NULL;
+	}
 
 	return (err);
 }
@@ -405,7 +421,19 @@ dsl_pool_close(dsl_pool_t *dp)
 	mutex_destroy(&dp->dp_lock);
 
 	cv_destroy(&dp->dp_spaceavail_cv);
+
+#ifdef __APPLE__
+	// As we vflush for umount, we might create more attach taskq, so
+	// we need to wait twice. (One wait is in taskq_destroy)
+	taskq_wait(dp->dp_vnget_taskq);
+	taskq_wait(dp->dp_vnrele_taskq);
+#endif
+	taskq_destroy(dp->dp_vnget_taskq);
 	taskq_destroy(dp->dp_vnrele_taskq);
+	dp->dp_vnrele_taskq = NULL;
+
+	taskq_destroy(dp->dp_unlinked_drain_taskq);
+
 	if (dp->dp_blkstats != NULL) {
 		mutex_destroy(&dp->dp_blkstats->zab_lock);
 		kmem_free(dp->dp_blkstats, sizeof (zfs_all_blkstats_t));
@@ -1076,6 +1104,18 @@ taskq_t *
 dsl_pool_vnrele_taskq(dsl_pool_t *dp)
 {
 	return (dp->dp_vnrele_taskq);
+}
+
+taskq_t *
+dsl_pool_vnget_taskq(dsl_pool_t *dp)
+{
+	return (dp->dp_vnget_taskq);
+}
+
+taskq_t *
+dsl_pool_unlinked_drain_taskq(dsl_pool_t *dp)
+{
+	return (dp->dp_unlinked_drain_taskq);
 }
 
 /*

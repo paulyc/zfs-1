@@ -41,9 +41,12 @@ SUBDIRS = \
 	zpool_offline \
 	zpool_online \
 	zpool_remove \
+	zpool_reopen \
 	zpool_replace \
+	zpool_resilver \
 	zpool_scrub \
 	zpool_set \
 	zpool_status \
 	zpool_sync \
+	zpool_trim \
 	zpool_upgrade

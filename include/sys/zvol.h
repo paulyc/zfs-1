@@ -49,6 +49,11 @@ extern void zvol_rename_minors(spa_t *spa, const char *oldname,
 #define	ZVOL_DUMPIFIED	0x2
 #define	ZVOL_EXCL	0x4
 #define	ZVOL_WCE	0x8
+/*
+ * Whether the zvol has been written to (as opposed to ZVOL_RDONLY, which
+ * specifies whether or not the zvol _can_ be written to)
+ */
+#define	ZVOL_WRITTEN_TO	0x10
 
 /* struct wrapper for IOKit class */
 typedef struct zvol_iokit zvol_iokit_t;
@@ -67,10 +72,8 @@ typedef struct zvol_state {
 	uint32_t zv_open_count;	/* open counts */
 	uint32_t zv_total_opens;	/* total open count */
 	zilog_t *zv_zilog;	/* ZIL handle */
+	rangelock_t		zv_rangelock;	/* for range locking */
 	list_t zv_extents;	/* List of extents for dump */
-#ifdef _KERNEL
-	znode_t zv_znode;	/* for range locking */
-#endif
 	dmu_buf_t *zv_dbuf;	/* bonus handle */
 	zvol_iokit_t *zv_iokitdev;	/* IOKit device */
 	uint64_t zv_openflags;	/* Remember flags used at open */
@@ -121,6 +124,10 @@ extern void zvol_remove_minors_symlink(const char *name);
 extern int zvol_set_volsize(const char *, uint64_t);
 extern int zvol_set_volblocksize(const char *, uint64_t);
 extern int zvol_set_snapdev(const char *, zprop_source_t, uint64_t);
+
+extern zvol_state_t *zvol_suspend(const char *);
+extern int zvol_resume(zvol_state_t *);
+extern void *zvol_tag(zvol_state_t *);
 
 extern int zvol_open(dev_t dev, int flag, int otyp, struct proc *p);
 extern int zvol_close(dev_t dev, int flag, int otyp, struct proc *p);

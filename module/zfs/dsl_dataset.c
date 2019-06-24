@@ -55,6 +55,8 @@
 #include <sys/dsl_userhold.h>
 #include <sys/dsl_bookmark.h>
 #include <sys/dbuf.h>
+#include <sys/policy.h>
+#include <sys/dmu_recv.h>
 #include <sys/zio_compress.h>
 #include <zfs_fletcher.h>
 #include <sys/dmu_send.h>
@@ -344,7 +346,7 @@ dsl_dataset_evict_async(void *dbu)
 	mutex_destroy(&ds->ds_opening_lock);
 	mutex_destroy(&ds->ds_sendstream_lock);
 	mutex_destroy(&ds->ds_remap_deadlist_lock);
-	refcount_destroy(&ds->ds_longholds);
+	zfs_refcount_destroy(&ds->ds_longholds);
 	rrw_destroy(&ds->ds_bp_rwlock);
 
 	kmem_free(ds, sizeof (dsl_dataset_t));
@@ -488,7 +490,7 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 		mutex_init(&ds->ds_remap_deadlist_lock,
 		    NULL, MUTEX_DEFAULT, NULL);
 		rrw_init(&ds->ds_bp_rwlock, B_FALSE);
-		refcount_create(&ds->ds_longholds);
+		zfs_refcount_create(&ds->ds_longholds);
 
 		bplist_create(&ds->ds_pending_deadlist);
 
@@ -554,6 +556,13 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 			ds->ds_reserved = ds->ds_quota = 0;
 		}
 
+		if (err == 0 && ds->ds_dir->dd_crypto_obj != 0 &&
+		    ds->ds_is_snapshot &&
+		    zap_contains(mos, dsobj, DS_FIELD_IVSET_GUID) != 0) {
+			dp->dp_spa->spa_errata =
+			    ZPOOL_ERRATA_ZOL_8308_ENCRYPTION;
+		}
+
 		dsl_deadlist_open(&ds->ds_deadlist,
 		    mos, dsl_dataset_phys(ds)->ds_deadlist_obj);
 		uint64_t remap_deadlist_obj =
@@ -576,10 +585,14 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 			if (ds->ds_prev)
 				dsl_dataset_rele(ds->ds_prev, ds);
 			dsl_dir_rele(ds->ds_dir, ds);
+			list_destroy(&ds->ds_prop_cbs);
+			list_destroy(&ds->ds_sendstreams);
 			mutex_destroy(&ds->ds_lock);
 			mutex_destroy(&ds->ds_opening_lock);
 			mutex_destroy(&ds->ds_sendstream_lock);
-			refcount_destroy(&ds->ds_longholds);
+			mutex_destroy(&ds->ds_remap_deadlist_lock);
+			zfs_refcount_destroy(&ds->ds_longholds);
+			rrw_destroy(&ds->ds_bp_rwlock);
 			kmem_free(ds, sizeof (dsl_dataset_t));
 			if (err != 0) {
 				dmu_buf_rele(dbuf, tag);
@@ -748,20 +761,20 @@ void
 dsl_dataset_long_hold(dsl_dataset_t *ds, void *tag)
 {
 	ASSERT(dsl_pool_config_held(ds->ds_dir->dd_pool));
-	(void) refcount_add(&ds->ds_longholds, tag);
+	(void) zfs_refcount_add(&ds->ds_longholds, tag);
 }
 
 void
 dsl_dataset_long_rele(dsl_dataset_t *ds, void *tag)
 {
-	(void) refcount_remove(&ds->ds_longholds, tag);
+	(void) zfs_refcount_remove(&ds->ds_longholds, tag);
 }
 
 /* Return B_TRUE if there are any long holds on this dataset. */
 boolean_t
 dsl_dataset_long_held(dsl_dataset_t *ds)
 {
-	return (!refcount_is_zero(&ds->ds_longholds));
+	return (!zfs_refcount_is_zero(&ds->ds_longholds));
 }
 
 void
@@ -1566,6 +1579,30 @@ dsl_dataset_snapshot_sync_impl(dsl_dataset_t *ds, const char *snapname,
 		dmu_object_zapify(mos, dsobj, DMU_OT_DSL_DATASET, tx);
 		VERIFY0(zap_add(mos, dsobj, DS_FIELD_REMAP_DEADLIST,
 		    sizeof (remap_deadlist_obj), 1, &remap_deadlist_obj, tx));
+	}
+
+	/*
+	 * Create a ivset guid for this snapshot if the dataset is
+	 * encrypted. This may be overridden by a raw receive. A
+	 * previous implementation of this code did not have this
+	 * field as part of the on-disk format for ZFS encryption
+	 * (see errata #4). As part of the remediation for this
+	 * issue, we ask the user to enable the bookmark_v2 feature
+	 * which is now a dependency of the encryption feature. We
+	 * use this as a heuristic to determine when the user has
+	 * elected to correct any datasets created with the old code.
+	 * As a result, we only do this step if the bookmark_v2
+	 * feature is enabled, which limits the number of states a
+	 * given pool / dataset can be in with regards to terms of
+	 * correcting the issue.
+	 */
+	if (ds->ds_dir->dd_crypto_obj != 0 &&
+	    spa_feature_is_enabled(dp->dp_spa, SPA_FEATURE_BOOKMARK_V2)) {
+		uint64_t ivset_guid = unique_create();
+
+		dmu_object_zapify(mos, dsobj, DMU_OT_DSL_DATASET, tx);
+		VERIFY0(zap_add(mos, dsobj, DS_FIELD_IVSET_GUID,
+		    sizeof (ivset_guid), 1, &ivset_guid, tx));
 	}
 
 	ASSERT3U(dsl_dataset_phys(ds)->ds_prev_snap_txg, <, tx->tx_txg);

@@ -1592,8 +1592,7 @@ zfs_vnop_fsync(struct vnop_fsync_args *ap)
 	 * zil_commit() or we will deadlock. But we know that vnop_reclaim will
 	 * be called next, so we just return success.
 	 */
-	// this might not be needed now
-	//if (vnode_isrecycled(ap->a_vp)) return 0;
+	if (vnode_isrecycled(ap->a_vp)) return 0;
 
 	err = zfs_fsync(ap->a_vp, /* flag */0, cr, ct);
 
@@ -2103,7 +2102,7 @@ zfs_pageout(zfsvfs_t *zfsvfs, znode_t *zp, upl_t upl, vm_offset_t upl_offset,
 			offset_t off, size_t size, int flags)
 {
 	dmu_tx_t *tx;
-	rl_t *rl;
+	locked_range_t *lr;
 	uint64_t filesz;
 	int err = 0;
 	size_t len = size;
@@ -2179,7 +2178,7 @@ zfs_pageout(zfsvfs_t *zfsvfs, znode_t *zp, upl_t upl, vm_offset_t upl_offset,
 
 
 top:
-	rl = zfs_range_lock(zp, off, len, RL_WRITER);
+	lr = rangelock_enter(&zp->z_rangelock, off, len, RL_WRITER);
 	/*
 	 * can't push pages passed end-of-file
 	 */
@@ -2217,7 +2216,7 @@ top:
 	err = dmu_tx_assign(tx, TXG_WAIT);
 	if (err != 0) {
 		if (err == ERESTART) {
-			zfs_range_unlock(rl);
+			rangelock_exit(lr);
 			dmu_tx_wait(tx);
 			dmu_tx_abort(tx);
 			goto top;
@@ -2290,7 +2289,7 @@ top:
 	dmu_tx_commit(tx);
 
 out:
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 	if (flags & UPL_IOSYNC)
 		zil_commit(zfsvfs->z_log, zp->z_id);
 
@@ -2465,11 +2464,10 @@ zfs_vnop_pageoutv2(struct vnop_pageout_args *ap)
 	zfsvfs_t *zfsvfs = NULL;
 	int error = 0;
 	uint64_t filesize;
-	rl_t *rl;
+	locked_range_t *lr;
 	dmu_tx_t *tx;
 	caddr_t vaddr = NULL;
 	int merror = 0;
-	dmu_buf_t       *db;
 
 	/* We can still get into this function as non-v2 style, by the default
 	 * pager (ie, swap - when we eventually support it)
@@ -2484,20 +2482,36 @@ zfs_vnop_pageoutv2(struct vnop_pageout_args *ap)
 		return ENXIO;
 	}
 
+	if (ZTOV(zp) == NULL) {
+		printf("ZFS: vnop_pageout: null vp\n");
+		return ENXIO;
+	}
+
+	// XNU can call us with iocount == 0 && usecount == 0. Grab
+	// a ref now so the vp doesn't reclaim while we are in here.
+	if (vnode_get(ZTOV(zp)) != 0) {
+		printf("ZFS: vnop_pageout: vnode_ref failed.\n");
+		return ENXIO;
+	}
+
 	mutex_enter(&zp->z_lock);
-	if (!zp->z_sa_hdl) {
+
+	sa_handle_t *z_sa_hdl;
+	z_sa_hdl = zp->z_sa_hdl;
+	if (!z_sa_hdl) {
 		mutex_exit(&zp->z_lock);
+		vnode_put(ZTOV(zp));
 		printf("ZFS: vnop_pageout: null sa_hdl\n");
 		return ENXIO;
 	}
 
 	zfsvfs = zp->z_zfsvfs;
 
-	error = sa_buf_hold(zfsvfs->z_os, zp->z_id, NULL, &db);
 	mutex_exit(&zp->z_lock);
 
 	if (error) {
 		printf("ZFS: %s: can't hold_sa: %d\n", __func__, error);
+		vnode_put(ZTOV(zp));
 		return ENXIO;
 	}
 
@@ -2526,7 +2540,7 @@ zfs_vnop_pageoutv2(struct vnop_pageout_args *ap)
 	ASSERT(vn_has_cached_data(ZTOV(zp)));
 	/* ASSERT(zp->z_dbuf_held); */ /* field no longer present in znode. */
 
-	rl = zfs_range_lock(zp, ap->a_f_offset, a_size, RL_WRITER);
+	lr = rangelock_enter(&zp->z_rangelock, ap->a_f_offset, a_size, RL_WRITER);
 
 	/* Grab UPL now */
 	int request_flags;
@@ -2556,7 +2570,9 @@ zfs_vnop_pageoutv2(struct vnop_pageout_args *ap)
 	tx = dmu_tx_create(zfsvfs->z_os);
 	dmu_tx_hold_write(tx, zp->z_id, ap->a_f_offset, ap->a_size);
 
-	dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
+	// NULL z_sa_hdl
+	if (z_sa_hdl != NULL)
+		dmu_tx_hold_sa(tx, z_sa_hdl, B_FALSE);
 
 	zfs_sa_upgrade_txholds(tx, zp);
 	error = dmu_tx_assign(tx, TXG_WAIT);
@@ -2719,8 +2735,7 @@ zfs_vnop_pageoutv2(struct vnop_pageout_args *ap)
 		vaddr = NULL;
 	}
   out:
-
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 	if (a_flags & UPL_IOSYNC)
 		zil_commit(zfsvfs->z_log, zp->z_id);
 
@@ -2730,7 +2745,8 @@ zfs_vnop_pageoutv2(struct vnop_pageout_args *ap)
 		ubc_upl_commit_range(upl, 0, a_size, UPL_COMMIT_FREE_ON_EMPTY);
 
 	upl = NULL;
-	sa_buf_rele(db, NULL);
+
+	vnode_put(ZTOV(zp));
 
 	ZFS_EXIT(zfsvfs);
 	if (error)
@@ -2738,13 +2754,14 @@ zfs_vnop_pageoutv2(struct vnop_pageout_args *ap)
 	return (error);
 
   pageout_done:
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 
   exit_abort:
 	dprintf("ZFS: pageoutv2 aborted %d\n", error);
 	//VERIFY(ubc_create_upl(vp, off, len, &upl, &pl, flags) == 0);
 	//ubc_upl_abort(upl, UPL_ABORT_FREE_ON_EMPTY);
-	sa_buf_rele(db, NULL);
+
+	vnode_put(ZTOV(zp));
 
 	if (zfsvfs)
 		ZFS_EXIT(zfsvfs);
@@ -3240,7 +3257,7 @@ zfs_vnop_getxattr(struct vnop_getxattr_args *ap)
 #endif
 
 	if (zfsvfs->z_use_sa && zp->z_is_sa) {
-		char *value;
+		char *value = NULL;
 
 		rw_enter(&zp->z_xattr_lock, RW_READER);
 		if (zp->z_xattr_cached == NULL)
@@ -3260,8 +3277,9 @@ zfs_vnop_getxattr(struct vnop_getxattr_args *ap)
 			}
 		}
 
-		value = kmem_alloc(resid, KM_SLEEP);
-		if (value) {
+		if (resid)
+			value = kmem_alloc(resid, KM_SLEEP);
+		if (value && resid) {
 			rw_enter(&zp->z_xattr_lock, RW_READER);
 			error = zpl_xattr_get_sa(vp, ap->a_name, value, resid);
 			rw_exit(&zp->z_xattr_lock);
@@ -4823,6 +4841,132 @@ zfs_znode_getvnode(znode_t *zp, zfsvfs_t *zfsvfs)
 
 	return (0);
 }
+
+
+/*
+ * Called by taskq, to call zfs_znode_getvnode( vnode_create( - and
+ * attach vnode to znode.
+ */
+void zfs_znode_asyncgetvnode_impl(void *arg)
+{
+    znode_t *zp = (znode_t *)arg;
+	VERIFY3P(zp, !=, NULL);
+	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
+	VERIFY3P(zfsvfs, !=, NULL);
+
+	// Attach vnode, done as different thread
+	zfs_znode_getvnode(zp, zfsvfs);
+
+	// Wake up anyone blocked on us
+	mutex_enter(&zp->z_attach_lock);
+	taskq_init_ent(&zp->z_attach_taskq);
+	cv_broadcast(&zp->z_attach_cv);
+	mutex_exit(&zp->z_attach_lock);
+
+}
+
+
+/*
+ * If the znode's vnode is not yet attached (zp->z_vnode == NULL)
+ * we call taskq_wait to wait for it to complete.
+ * We guarantee znode has a vnode at the return of function only
+ * when return is "0". On failure to wait, it returns -1, and caller
+ * may consider waiting by other means.
+ */
+int zfs_znode_asyncwait(znode_t *zp)
+{
+	int ret = -1;
+	zfsvfs_t *zfsvfs;
+
+	if (zp == NULL)
+		return ret;
+
+	zfsvfs = zp->z_zfsvfs;
+	if (zfsvfs == NULL)
+		return ret;
+
+	ZFS_ENTER_NOERROR(zfsvfs);
+	if (zfsvfs->z_unmounted)
+		goto out;
+
+	if (zfsvfs->z_os == NULL)
+		goto out;
+
+	// Work out if we need to block, that is, we have
+	// no vnode AND a taskq was launched. Unsure if we should
+	// look inside taskqent node like this.
+	mutex_enter(&zp->z_attach_lock);
+	if (zp->z_vnode == NULL &&
+		zp->z_attach_taskq.tqent_func != NULL) {
+		// We need to block and wait for taskq to finish.
+		cv_wait(&zp->z_attach_cv, &zp->z_attach_lock);
+		ret = 0;
+	}
+	mutex_exit(&zp->z_attach_lock);
+
+out:
+	ZFS_EXIT(zfsvfs);
+	return ret;
+}
+
+/*
+ * Called in place of VN_RELE() for the places that uses ZGET_FLAG_ASYNC.
+ */
+void zfs_znode_asyncput_impl(znode_t *zp)
+{
+	// Make sure the other thread finished zfs_znode_getvnode();
+	// This may block, if waiting is required.
+	zfs_znode_asyncwait(zp);
+
+	// Safe to release now that it is attached.
+	VN_RELE(ZTOV(zp));
+}
+
+/*
+ * Called in place of VN_RELE() for the places that uses ZGET_FLAG_ASYNC,
+ * where we also taskq it - as we come from reclaim.
+ */
+void zfs_znode_asyncput(znode_t *zp)
+{
+	dsl_pool_t *dp = dmu_objset_pool(zp->z_zfsvfs->z_os);
+	taskq_t *tq = dsl_pool_vnrele_taskq(dp);
+	VERIFY3P(tq, !=, NULL);
+
+	VERIFY(taskq_dispatch(
+		(taskq_t *)tq,
+		(task_func_t *)zfs_znode_asyncput_impl, zp, TQ_SLEEP) != 0);
+}
+
+/*
+ * Attach a new vnode to the znode asynchronically. We do this using
+ * a taskq to call it, and then wait to release the iocount.
+ * Called of zget_ext(..., ZGET_FLAG_ASYNC); will use
+ * zfs_znode_asyncput(zp) instead of VN_RELE(vp).
+ */
+int
+zfs_znode_asyncgetvnode(znode_t *zp, zfsvfs_t *zfsvfs)
+{
+	VERIFY(zp != NULL);
+	VERIFY(zfsvfs != NULL);
+
+	// We should not have a vnode here.
+	VERIFY3P(ZTOV(zp), ==, NULL);
+
+	dsl_pool_t *dp = dmu_objset_pool(zfsvfs->z_os);
+	taskq_t *tq = dsl_pool_vnget_taskq(dp);
+	VERIFY3P(tq, !=, NULL);
+
+	mutex_enter(&zp->z_attach_lock);
+	taskq_dispatch_ent(tq,
+		(task_func_t *)zfs_znode_asyncgetvnode_impl,
+		zp,
+		TQ_SLEEP,
+		&zp->z_attach_taskq);
+	mutex_exit(&zp->z_attach_lock);
+	return 0;
+}
+
+
 
 /*
  * Maybe these should live in vfsops

@@ -47,14 +47,10 @@ AC_CONFIG_HEADERS([zfs_config.h], [
 	rm zfs_config.h.tmp) || exit 1])
 
 AC_PROG_INSTALL
-dnl save $CFLAGS since AC_PROG_CC likes to insert "-g -O2"
-dnl if $CFLAGS is blank
-cflags_save="$CFLAGS"
 AC_PROG_CC(clang)
 AC_PROG_CXX(clang++)
 AC_PROG_OBJC(clang)
 AC_PROG_OBJCXX(clang++)
-CFLAGS="$cflags_save"
 AC_PROG_LIBTOOL
 AM_PROG_CC_C_O
 AM_PROG_AS
@@ -66,11 +62,6 @@ ZFS_AC_CONFIG
 ZFS_AC_DEBUG
 ZFS_AC_DEBUG_DMU_TX
 ZFS_AC_BOOT
-
-# during dev
-if test "x$ac_cv_prog_gcc" = xyes ; then
-   CFLAGS="$CFLAGS -g "
-fi
 
 AC_CONFIG_FILES([
 	Makefile
@@ -143,12 +134,7 @@ AC_CONFIG_FILES([
 	contrib/dracut/90zfs/Makefile
 	contrib/initramfs/Makefile
 	module/Makefile
-	module/avl/Makefile
-	module/nvpair/Makefile
-	module/unicode/Makefile
-	module/zcommon/Makefile
 	module/zfs/Makefile
-	module/zpios/Makefile
 	include/Makefile
 	include/sys/Makefile
 	include/sys/fs/Makefile

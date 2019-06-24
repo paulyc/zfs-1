@@ -107,6 +107,7 @@
 #include <sys/vdev_impl.h>
 #include <sys/vdev_file.h>
 #include <sys/vdev_initialize.h>
+#include <sys/vdev_trim.h>
 #include <sys/spa_impl.h>
 #include <sys/metaslab_impl.h>
 #include <sys/dsl_prop.h>
@@ -261,7 +262,9 @@ typedef struct bufwad {
 } bufwad_t;
 
 /*
- * XXX -- fix zfs range locks to be generic so we can use them here.
+ * It would be better to use a rangelock_t per object.  Unfortunately
+ * the rangelock_t is not a drop-in replacement for rl_t, because we
+ * still need to map from object ID to rangelock_t.
  */
 typedef enum {
 	RL_READER,
@@ -373,6 +376,7 @@ ztest_func_t ztest_spa_upgrade;
 ztest_func_t ztest_device_removal;
 ztest_func_t ztest_spa_checkpoint_create_discard;
 ztest_func_t ztest_initialize;
+ztest_func_t ztest_trim;
 ztest_func_t ztest_verify_dnode_bt;
 
 uint64_t zopt_always = 0ULL * NANOSEC;		/* all the time */
@@ -424,6 +428,7 @@ ztest_info_t ztest_info[] = {
 	ZTI_INIT(ztest_device_removal, 1, &zopt_sometimes),
 	ZTI_INIT(ztest_spa_checkpoint_create_discard, 1, &zopt_rarely),
 	ZTI_INIT(ztest_initialize, 1, &zopt_sometimes),
+	ZTI_INIT(ztest_trim, 1, &zopt_sometimes),
 	ZTI_INIT(ztest_verify_dnode_bt, 1, &zopt_sometimes),
 };
 
@@ -2143,12 +2148,12 @@ static void
 ztest_get_done(zgd_t *zgd, int error)
 {
 	ztest_ds_t *zd = zgd->zgd_private;
-	uint64_t object = zgd->zgd_rl->rl_object;
+	uint64_t object = ((rl_t *)zgd->zgd_lr)->rl_object;
 
 	if (zgd->zgd_db)
 		dmu_buf_rele(zgd->zgd_db, zgd);
 
-	ztest_range_unlock(zgd->zgd_rl);
+	ztest_range_unlock((rl_t *)zgd->zgd_lr);
 	ztest_object_unlock(zd, object);
 
 	if (error == 0 && zgd->zgd_bp)
@@ -2159,7 +2164,7 @@ ztest_get_done(zgd_t *zgd, int error)
 
 static int
 ztest_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb,
-	zio_t *zio, struct znode *zp, struct rl *rl)
+	zio_t *zio)
 {
 	ztest_ds_t *zd = arg;
 	objset_t *os = zd->zd_os;
@@ -2201,8 +2206,8 @@ ztest_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb,
 	zgd->zgd_private = zd;
 
 	if (buf != NULL) {	/* immediate write */
-		zgd->zgd_rl = ztest_range_lock(zd, object, offset, size,
-		    RL_READER);
+		zgd->zgd_lr = (struct locked_range *)ztest_range_lock(zd,
+		    object, offset, size, RL_READER);
 
 		error = dmu_read(os, object, offset, size, buf,
 		    DMU_READ_NO_PREFETCH);
@@ -2216,8 +2221,8 @@ ztest_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb,
 			offset = 0;
 		}
 
-		zgd->zgd_rl = ztest_range_lock(zd, object, offset, size,
-		    RL_READER);
+		zgd->zgd_lr = (struct locked_range *)ztest_range_lock(zd,
+		    object, offset, size, RL_READER);
 
 		error = dmu_buf_hold(os, object, offset, zgd, &db,
 		    DMU_READ_NO_PREFETCH);
@@ -4801,14 +4806,14 @@ ztest_dmu_read_write_zcopy(ztest_ds_t *zd, uint64_t id)
 				    FTAG, &dbt, DMU_READ_NO_PREFETCH) == 0);
 			}
 			if (i != 5 || chunksize < (SPA_MINBLOCKSIZE * 2)) {
-				dmu_assign_arcbuf_by_dbuf(bonus_db, off,
-				    bigbuf_arcbufs[j], tx);
+				VERIFY0(dmu_assign_arcbuf_by_dbuf(bonus_db,
+				    off, bigbuf_arcbufs[j], tx));
 			} else {
-				dmu_assign_arcbuf_by_dbuf(bonus_db, off,
-				    bigbuf_arcbufs[2 * j], tx);
-				dmu_assign_arcbuf_by_dbuf(bonus_db,
+				VERIFY0(dmu_assign_arcbuf_by_dbuf(bonus_db,
+				    off, bigbuf_arcbufs[2 * j], tx));
+				VERIFY0(dmu_assign_arcbuf_by_dbuf(bonus_db,
 				    off + chunksize / 2,
-				    bigbuf_arcbufs[2 * j + 1], tx);
+				    bigbuf_arcbufs[2 * j + 1], tx));
 			}
 			if (i == 1) {
 				dmu_buf_rele(dbt, FTAG);
@@ -4835,7 +4840,7 @@ ztest_dmu_read_write_zcopy(ztest_ds_t *zd, uint64_t id)
 			umem_free(bigcheck, bigsize);
 		}
 		if (i == 2) {
-			txg_wait_open(dmu_objset_pool(os), 0);
+			txg_wait_open(dmu_objset_pool(os), 0, B_TRUE);
 		} else if (i == 3) {
 			txg_wait_synced(dmu_objset_pool(os), 0);
 		}
@@ -5509,6 +5514,8 @@ ztest_spa_prop_get_set(ztest_ds_t *zd, uint64_t id)
 
 	(void) ztest_spa_prop_set_uint64(ZPOOL_PROP_DEDUPDITTO,
 	    ZIO_DEDUPDITTO_MIN + ztest_random(ZIO_DEDUPDITTO_MIN));
+
+	(void) ztest_spa_prop_set_uint64(ZPOOL_PROP_AUTOTRIM, ztest_random(2));
 
 	VERIFY0(spa_prop_get(ztest_spa, &props));
 
@@ -6216,7 +6223,14 @@ ztest_initialize(ztest_ds_t *zd, uint64_t id)
 	spa_config_exit(spa, SCL_VDEV, FTAG);
 
 	uint64_t cmd = ztest_random(POOL_INITIALIZE_FUNCS);
-	error = spa_vdev_initialize(spa, guid, cmd);
+
+	nvlist_t *vdev_guids = fnvlist_alloc();
+	nvlist_t *vdev_errlist = fnvlist_alloc();
+	fnvlist_add_uint64(vdev_guids, path, guid);
+	error = spa_vdev_initialize(spa, vdev_guids, cmd, vdev_errlist);
+	fnvlist_free(vdev_guids);
+	fnvlist_free(vdev_errlist);
+
 	switch (cmd) {
 	case POOL_INITIALIZE_CANCEL:
 		if (ztest_opts.zo_verbose >= 4) {
@@ -6226,7 +6240,7 @@ ztest_initialize(ztest_ds_t *zd, uint64_t id)
 			(void) printf("\n");
 		}
 		break;
-	case POOL_INITIALIZE_DO:
+	case POOL_INITIALIZE_START:
 		if (ztest_opts.zo_verbose >= 4) {
 			(void) printf("Start initialize %s", path);
 			if (active && error == 0)
@@ -6241,6 +6255,82 @@ ztest_initialize(ztest_ds_t *zd, uint64_t id)
 			(void) printf("Suspend initialize %s", path);
 			if (!active)
 				(void) printf(" failed (no initialize active)");
+			(void) printf("\n");
+		}
+		break;
+	}
+	free(path);
+	mutex_exit(&ztest_vdev_lock);
+}
+
+/* ARGSUSED */
+void
+ztest_trim(ztest_ds_t *zd, uint64_t id)
+{
+	spa_t *spa = ztest_spa;
+	int error = 0;
+
+	mutex_enter(&ztest_vdev_lock);
+
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+
+	/* Random leaf vdev */
+	vdev_t *rand_vd = ztest_random_concrete_vdev_leaf(spa->spa_root_vdev);
+	if (rand_vd == NULL) {
+		spa_config_exit(spa, SCL_VDEV, FTAG);
+		mutex_exit(&ztest_vdev_lock);
+		return;
+	}
+
+	/*
+	 * The random vdev we've selected may change as soon as we
+	 * drop the spa_config_lock. We create local copies of things
+	 * we're interested in.
+	 */
+	uint64_t guid = rand_vd->vdev_guid;
+	char *path = strdup(rand_vd->vdev_path);
+	boolean_t active = rand_vd->vdev_trim_thread != NULL;
+
+	zfs_dbgmsg("vd %p, guid %llu", rand_vd, guid);
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+
+	uint64_t cmd = ztest_random(POOL_TRIM_FUNCS);
+	uint64_t rate = 1 << ztest_random(30);
+	boolean_t partial = (ztest_random(5) > 0);
+	boolean_t secure = (ztest_random(5) > 0);
+
+	nvlist_t *vdev_guids = fnvlist_alloc();
+	nvlist_t *vdev_errlist = fnvlist_alloc();
+	fnvlist_add_uint64(vdev_guids, path, guid);
+	error = spa_vdev_trim(spa, vdev_guids, cmd, rate, partial,
+	    secure, vdev_errlist);
+	fnvlist_free(vdev_guids);
+	fnvlist_free(vdev_errlist);
+
+	switch (cmd) {
+	case POOL_TRIM_CANCEL:
+		if (ztest_opts.zo_verbose >= 4) {
+			(void) printf("Cancel TRIM %s", path);
+			if (!active)
+				(void) printf(" failed (no TRIM active)");
+			(void) printf("\n");
+		}
+		break;
+	case POOL_TRIM_START:
+		if (ztest_opts.zo_verbose >= 4) {
+			(void) printf("Start TRIM %s", path);
+			if (active && error == 0)
+				(void) printf(" failed (already active)");
+			else if (error != 0)
+				(void) printf(" failed (error %d)", error);
+			(void) printf("\n");
+		}
+		break;
+	case POOL_TRIM_SUSPEND:
+		if (ztest_opts.zo_verbose >= 4) {
+			(void) printf("Suspend TRIM %s", path);
+			if (!active)
+				(void) printf(" failed (no TRIM active)");
 			(void) printf("\n");
 		}
 		break;

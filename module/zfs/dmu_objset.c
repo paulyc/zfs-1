@@ -27,6 +27,8 @@
  * Copyright (c) 2015, STRATO AG, Inc. All rights reserved.
  * Copyright (c) 2016 Actifio, Inc. All rights reserved.
  * Copyright 2017 Nexenta Systems, Inc.
+ * Copyright (c) 2017 Open-E, Inc. All Rights Reserved.
+ * Copyright (c) 2018, loli10K <ezomori.nozomu@gmail.com>. All rights reserved.
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
@@ -52,8 +54,10 @@
 #include <sys/zfs_onexit.h>
 #include <sys/dsl_destroy.h>
 #include <sys/vdev.h>
-#include <sys/dmu_send.h>
 #include <sys/zfeature.h>
+#include <sys/policy.h>
+#include <sys/spa_impl.h>
+#include <sys/dmu_recv.h>
 #include "zfs_namecheck.h"
 
 /*
@@ -274,36 +278,6 @@ redundant_metadata_changed_cb(void *arg, uint64_t newval)
 
 	os->os_redundant_metadata = newval;
 }
-
-#ifdef linux
-static void
-dnodesize_changed_cb(void *arg, uint64_t newval)
-{
-	objset_t *os = arg;
-
-	switch (newval) {
-	case ZFS_DNSIZE_LEGACY:
-		os->os_dnodesize = DNODE_MIN_SIZE;
-		break;
-	case ZFS_DNSIZE_AUTO:
-		/*
-		 * Choose a dnode size that will work well for most
-		 * workloads if the user specified "auto". Future code
-		 * improvements could dynamically select a dnode size
-		 * based on observed workload patterns.
-		 */
-		os->os_dnodesize = DNODE_MIN_SIZE * 2;
-		break;
-	case ZFS_DNSIZE_1K:
-	case ZFS_DNSIZE_2K:
-	case ZFS_DNSIZE_4K:
-	case ZFS_DNSIZE_8K:
-	case ZFS_DNSIZE_16K:
-		os->os_dnodesize = newval;
-		break;
-	}
-}
-#endif
 
 static void
 smallblk_changed_cb(void *arg, uint64_t newval)
@@ -1093,6 +1067,8 @@ dmu_objset_create_check(void *arg, dmu_tx_t *tx)
 	dmu_objset_create_arg_t *doca = arg;
 	dsl_pool_t *dp = dmu_tx_pool(tx);
 	dsl_dir_t *pdd;
+	dsl_dataset_t *parentds;
+	objset_t *parentos;
 	const char *tail;
 	int error;
 
@@ -1113,7 +1089,7 @@ dmu_objset_create_check(void *arg, dmu_tx_t *tx)
 		return (SET_ERROR(EEXIST));
 	}
 
-	error = dmu_objset_create_crypt_check(pdd, doca->doca_dcp);
+	error = dmu_objset_create_crypt_check(pdd, doca->doca_dcp, NULL);
 	if (error != 0) {
 		dsl_dir_rele(pdd, FTAG);
 		return (error);
@@ -1121,7 +1097,30 @@ dmu_objset_create_check(void *arg, dmu_tx_t *tx)
 
 	error = dsl_fs_ss_limit_check(pdd, 1, ZFS_PROP_FILESYSTEM_LIMIT, NULL,
 	    doca->doca_cred);
+	if (error != 0) {
+		dsl_dir_rele(pdd, FTAG);
+		return (error);
+	}
 
+	/* can't create below anything but filesystems (eg. no ZVOLs) */
+	error = dsl_dataset_hold_obj(pdd->dd_pool,
+	    dsl_dir_phys(pdd)->dd_head_dataset_obj, FTAG, &parentds);
+	if (error != 0) {
+		dsl_dir_rele(pdd, FTAG);
+		return (error);
+	}
+	error = dmu_objset_from_ds(parentds, &parentos);
+	if (error != 0) {
+		dsl_dataset_rele(parentds, FTAG);
+		dsl_dir_rele(pdd, FTAG);
+		return (error);
+	}
+	if (dmu_objset_type(parentos) != DMU_OST_ZFS) {
+		dsl_dataset_rele(parentds, FTAG);
+		dsl_dir_rele(pdd, FTAG);
+		return (SET_ERROR(ZFS_ERR_WRONG_PARENT));
+	}
+	dsl_dataset_rele(parentds, FTAG);
 	dsl_dir_rele(pdd, FTAG);
 
 	return (error);
