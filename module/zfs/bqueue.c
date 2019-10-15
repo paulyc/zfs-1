@@ -92,12 +92,19 @@ bqueue_dequeue(bqueue_t *q)
 	mutex_enter(&q->bq_lock);
 	while (q->bq_size == 0) {
 		cv_wait_sig(&q->bq_pop_cv, &q->bq_lock);
+#ifdef __APPLE__
+		/* This loop can starve out bqueue_enqueue()'s cv_wait_sig().
+		 */
+		mutex_exit(&q->bq_lock);
+		kpreempt(KPREEMPT_SYNC);
+		mutex_enter(&q->bq_lock);
+#endif
 	}
 	ret = list_remove_head(&q->bq_list);
 	item_size = obj2node(q, ret)->bqn_size;
 	q->bq_size -= item_size;
-	mutex_exit(&q->bq_lock);
 	cv_signal(&q->bq_add_cv);
+	mutex_exit(&q->bq_lock);
 	return (ret);
 }
 
